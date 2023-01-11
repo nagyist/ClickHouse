@@ -22,7 +22,7 @@ public:
     /// Query is needed for pruning by virtual columns (_file, _path)
     virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(ASTPtr query, ContextPtr context) const = 0;
 
-    bool isRemote() const override { return true; }
+    bool isRemote([[ maybe_unused ]] ContextPtr local_context) const override { return true; }
 };
 
 

@@ -8,6 +8,7 @@
 #include <Processors/QueryPlan/CreatingSetsStep.h>
 #include <Processors/QueryPlan/CubeStep.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
+#include <Processors/QueryPlan/ReadFromRemote.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Processors/QueryPlan/TotalsHavingStep.h>
 #include <Processors/QueryPlan/DistinctStep.h>
@@ -1005,8 +1006,6 @@ InputOrderInfoPtr buildInputOrderInfo(SortingStep & sorting, QueryPlan::Node & n
 
     if (auto * reading = typeid_cast<ReadFromMergeTree *>(reading_node->step.get()))
     {
-
-        //std::cerr << "---- optimizeReadInOrder found mt" << std::endl;
         auto order_info = buildInputOrderInfo(
             reading,
             fixed_columns,
@@ -1026,6 +1025,8 @@ InputOrderInfoPtr buildInputOrderInfo(SortingStep & sorting, QueryPlan::Node & n
             dag, description,
             limit);
 
+        /// Note that for parallel replicas this is also a sign
+        /// that we need initialize Coordinator with ordered read method
         if (order_info)
             merge->requestReadingInOrder(order_info);
 
