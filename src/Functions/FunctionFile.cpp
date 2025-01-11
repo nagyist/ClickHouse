@@ -38,6 +38,8 @@ public:
     String getName() const override { return name; }
     size_t getNumberOfArguments() const override { return 0; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+    bool isDeterministic() const override { return false; }
+    bool isDeterministicInScopeOfQuery() const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -59,6 +61,11 @@ public:
                 throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} only accepts String or Null as second argument", getName());
         }
 
+        return std::make_shared<DataTypeString>();
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
         return std::make_shared<DataTypeString>();
     }
 
@@ -127,13 +134,12 @@ public:
 
             try
             {
-                if (need_check && file_path.string().find(user_files_absolute_path_string) != 0)
+                if (need_check && !file_path.string().starts_with(user_files_absolute_path_string))
                     throw Exception(ErrorCodes::DATABASE_ACCESS_DENIED, "File is not inside {}", user_files_absolute_path.string());
 
                 ReadBufferFromFile in(file_path);
-                WriteBufferFromVector out(res_chars, AppendModeTag{});
+                auto out = WriteBufferFromVector<ColumnString::Chars>(res_chars, AppendModeTag{});
                 copyData(in, out);
-                out.finalize();
             }
             catch (...)
             {

@@ -28,7 +28,7 @@ String getBlockDeviceId([[maybe_unused]] const String & path);
 
 std::optional<String> tryGetBlockDeviceId([[maybe_unused]] const String & path);
 
-enum class BlockDeviceType
+enum class BlockDeviceType : uint8_t
 {
     UNKNOWN = 0, // we were unable to determine device type
     NONROT = 1, // not a rotational device (SSD, NVME, etc)
@@ -56,7 +56,7 @@ std::filesystem::path getMountPoint(std::filesystem::path absolute_path);
 #endif
 String getFilesystemName([[maybe_unused]] const String & mount_point);
 
-struct statvfs getStatVFS(const String & path);
+struct statvfs getStatVFS(String path);
 
 /// Returns true if path starts with prefix path
 bool pathStartsWith(const std::filesystem::path & path, const std::filesystem::path & prefix_path);
@@ -95,6 +95,7 @@ void setModificationTime(const std::string & path, time_t time);
 time_t getChangeTime(const std::string & path);
 
 bool isSymlink(const fs::path & path);
+bool isSymlinkNoThrow(const fs::path & path);
 fs::path readSymlink(const fs::path & path);
 
 }

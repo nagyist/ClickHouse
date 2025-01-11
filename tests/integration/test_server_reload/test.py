@@ -6,20 +6,30 @@
 # pylint: disable=broad-except
 
 import contextlib
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
 import grpc
 import psycopg2
 import pymysql.connections
 import pymysql.err
 import pytest
-import sys
-import time
-import logging
-from helpers.cluster import ClickHouseCluster, run_and_check
-from helpers.client import Client, QueryRuntimeException
 from kazoo.exceptions import NodeExistsError
-from pathlib import Path
 from requests.exceptions import ConnectionError
 from urllib3.util.retry import Retry
+
+from helpers.client import Client, QueryRuntimeException
+from helpers.cluster import ClickHouseCluster, run_and_check
+
+script_dir = os.path.dirname(os.path.realpath(__file__))
+grpc_protocol_pb2_dir = os.path.join(script_dir, "grpc_protocol_pb2")
+if grpc_protocol_pb2_dir not in sys.path:
+    sys.path.append(grpc_protocol_pb2_dir)
+import clickhouse_grpc_pb2  # Execute grpc_protocol_pb2/generate.py to generate these modules.
+import clickhouse_grpc_pb2_grpc
 
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
@@ -34,28 +44,13 @@ instance = cluster.add_instance(
     user_configs=["configs/default_passwd.xml"],
     with_zookeeper=True,
     # Bug in TSAN reproduces in this test https://github.com/grpc/grpc/issues/29550#issuecomment-1188085387
-    # second_deadlock_stack -- just ordinary option we use everywhere, don't want to overwrite it
-    env_variables={"TSAN_OPTIONS": "report_atomic_races=0 second_deadlock_stack=1"},
+    env_variables={
+        "TSAN_OPTIONS": "report_atomic_races=0 " + os.getenv("TSAN_OPTIONS", default="")
+    },
 )
 
 
 LOADS_QUERY = "SELECT value FROM system.events WHERE event = 'MainConfigLoads'"
-
-
-# Use grpcio-tools to generate *pb2.py files from *.proto.
-
-proto_dir = Path(__file__).parent / "protos"
-gen_dir = Path(__file__).parent / "_gen"
-gen_dir.mkdir(exist_ok=True)
-run_and_check(
-    f"python3 -m grpc_tools.protoc -I{proto_dir!s} --python_out={gen_dir!s} --grpc_python_out={gen_dir!s} \
-    {proto_dir!s}/clickhouse_grpc.proto",
-    shell=True,
-)
-
-sys.path.append(str(gen_dir))
-import clickhouse_grpc_pb2
-import clickhouse_grpc_pb2_grpc
 
 
 @pytest.fixture(name="cluster", scope="module")
@@ -383,7 +378,7 @@ def test_reload_via_client(cluster, zk):
                         configure_from_zk(zk)
                     break
                 except QueryRuntimeException:
-                    logging.exception("The new socket is not binded yet")
+                    logging.exception("The new socket is not bound yet")
                     time.sleep(0.1)
 
     if exception:

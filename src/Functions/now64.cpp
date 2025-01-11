@@ -1,10 +1,12 @@
 #include <DataTypes/DataTypeDateTime64.h>
 
 #include <Core/DecimalFunctions.h>
+#include <Core/Settings.h>
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/extractTimeZoneFromFunctionArguments.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <Interpreters/Context.h>
 
 #include <Common/assert_cast.h>
 
@@ -13,11 +15,16 @@
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool allow_nonconst_timezone_arguments;
+}
+
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int CANNOT_CLOCK_GETTIME;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
 }
 
 namespace
@@ -29,7 +36,7 @@ Field nowSubsecond(UInt32 scale)
 
     timespec spec{};
     if (clock_gettime(CLOCK_REALTIME, &spec))
-        throwFromErrno("Cannot clock_gettime.", ErrorCodes::CANNOT_CLOCK_GETTIME);
+        throw ErrnoException(ErrorCodes::CANNOT_CLOCK_GETTIME, "Cannot clock_gettime");
 
     DecimalUtils::DecimalComponents<DateTime64> components{spec.tv_sec, spec.tv_nsec};
 
@@ -115,7 +122,10 @@ public:
     bool isVariadic() const override { return true; }
 
     size_t getNumberOfArguments() const override { return 0; }
-    static FunctionOverloadResolverPtr create(ContextPtr) { return std::make_unique<Now64OverloadResolver>(); }
+    static FunctionOverloadResolverPtr create(ContextPtr context) { return std::make_unique<Now64OverloadResolver>(context); }
+    explicit Now64OverloadResolver(ContextPtr context)
+        : allow_nonconst_timezone_arguments(context->getSettingsRef()[Setting::allow_nonconst_timezone_arguments])
+    {}
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -124,7 +134,7 @@ public:
 
         if (arguments.size() > 2)
         {
-            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Arguments size of function {} should be 0, or 1, or 2", getName());
+            throw Exception(ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION, "Arguments size of function {} should be 0, or 1, or 2", getName());
         }
         if (!arguments.empty())
         {
@@ -137,7 +147,7 @@ public:
         }
         if (arguments.size() == 2)
         {
-            timezone_name = extractTimeZoneNameFromFunctionArguments(arguments, 1, 0);
+            timezone_name = extractTimeZoneNameFromFunctionArguments(arguments, 1, 0, allow_nonconst_timezone_arguments);
         }
 
         return std::make_shared<DataTypeDateTime64>(scale, timezone_name);
@@ -157,13 +167,15 @@ public:
 
         return std::make_unique<FunctionBaseNow64>(nowSubsecond(scale), std::move(arg_types), result_type);
     }
+private:
+    const bool allow_nonconst_timezone_arguments;
 };
 
 }
 
 REGISTER_FUNCTION(Now64)
 {
-    factory.registerFunction<Now64OverloadResolver>({}, FunctionFactory::CaseInsensitive);
+    factory.registerFunction<Now64OverloadResolver>({}, FunctionFactory::Case::Insensitive);
 }
 
 }

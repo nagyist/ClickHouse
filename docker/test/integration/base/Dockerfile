@@ -11,7 +11,6 @@ RUN apt-get update \
         curl \
         default-jre \
         g++ \
-        gdb \
         iproute2 \
         krb5-user \
         libicu-dev \
@@ -33,7 +32,8 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
-RUN pip3 install pycurl
+COPY requirements.txt /
+RUN pip3 install --no-cache-dir -r requirements.txt && rm -rf /root/.cache/pip
 
 # Architecture of the image when BuildKit/buildx is used
 ARG TARGETARCH
@@ -46,12 +46,13 @@ RUN arch=${TARGETARCH:-amd64} \
       arm64) rarch=aarch64 ;; \
     esac \
   && cd /tmp \
-  && curl -o mysql-odbc.rpm "https://cdn.mysql.com/archives/mysql-connector-odbc-8.0/mysql-connector-odbc-8.0.27-1.el8.${rarch}.rpm" \
+  && curl -o mysql-odbc.rpm "https://cdn.mysql.com/archives/mysql-connector-odbc-8.0/mysql-connector-odbc-8.0.32-1.el9.${rarch}.rpm" \
   && rpm2archive mysql-odbc.rpm \
   && tar xf mysql-odbc.rpm.tgz -C / ./usr/lib64/ \
-  && LINK_DIR=$(dpkg -L libodbc1 | rg '^/usr/lib/.*-linux-gnu/odbc$') \
-  && ln -s /usr/lib64/libmyodbc8a.so "$LINK_DIR" \
-  && ln -s /usr/lib64/libmyodbc8a.so "$LINK_DIR"/libmyodbc.so
+  && rm mysql-odbc.rpm mysql-odbc.rpm.tgz \
+  && ODBC_DIR=$(dpkg -L odbc-postgresql | rg '^/usr/lib/.*-linux-gnu/odbc$') \
+  && ln -s /usr/lib64/libmyodbc8a.so "$ODBC_DIR" \
+  && ln -s /usr/lib64/libmyodbc8a.so "$ODBC_DIR"/libmyodbc.so
 
 # Unfortunately this is required for a single test for conversion data from zookeeper to clickhouse-keeper.
 # ZooKeeper is not started by default, but consumes some space in containers.
@@ -71,3 +72,6 @@ maxClientCnxns=80' > /opt/zookeeper/conf/zoo.cfg && \
 
 ENV TZ=Etc/UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+COPY --from=clickhouse/cctools:0d6b90a7a490 /opt/gdb /opt/gdb
+ENV PATH="/opt/gdb/bin:${PATH}"

@@ -1,3 +1,4 @@
+import importlib
 import logging
 import os
 import time
@@ -30,9 +31,23 @@ def start_mock_servers(cluster, script_dir, mocks, timeout=100):
             server_name,
         )
 
+        logs_dir = (
+            "/var/log/resolver"
+            if container == "resolver"
+            else "/var/log/clickhouse-server"
+        )
+        log_file = os.path.join(logs_dir, os.path.splitext(server_name)[0] + ".log")
+        err_log_file = os.path.join(
+            logs_dir, os.path.splitext(server_name)[0] + ".err.log"
+        )
+
         cluster.exec_in_container(
             container_id,
-            ["python", server_name, str(port)],
+            [
+                "bash",
+                "-c",
+                f"python3 {server_name} {port} >{log_file} 2>{err_log_file}",
+            ],
             detach=True,
         )
 
@@ -65,3 +80,28 @@ def start_mock_servers(cluster, script_dir, mocks, timeout=100):
             attempt += 1
 
     logging.info(f"Mock {server_names_with_desc} started")
+
+
+# The same as start_mock_servers, but
+# import servers from central directory tests/integration/helpers
+# and return the control instance
+def start_s3_mock(cluster, mock_name, port, timeout=100):
+    script_dir = os.path.join(os.path.dirname(__file__), "s3_mocks")
+    registered_servers = [
+        mock
+        for mock in os.listdir(script_dir)
+        if os.path.isfile(os.path.join(script_dir, mock))
+    ]
+
+    file_name = mock_name + ".py"
+    if file_name not in registered_servers:
+        raise KeyError(
+            f"Can't run s3 mock `{mock_name}`. No file `{file_name}` in directory `{script_dir}`"
+        )
+
+    start_mock_servers(cluster, script_dir, [(file_name, "resolver", port)], timeout)
+
+    fmt = importlib.import_module("." + mock_name, "helpers.s3_mocks")
+    control = getattr(fmt, "MockControl")(cluster, "resolver", port)
+
+    return control

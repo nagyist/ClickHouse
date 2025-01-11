@@ -7,13 +7,13 @@ sidebar_label: GROUP BY
 
 `GROUP BY` clause switches the `SELECT` query into an aggregation mode, which works as follows:
 
--   `GROUP BY` clause contains a list of expressions (or a single expression, which is considered to be the list of length one). This list acts as a “grouping key”, while each individual expression will be referred to as a “key expression”.
--   All the expressions in the [SELECT](../../../sql-reference/statements/select/index.md), [HAVING](../../../sql-reference/statements/select/having), and [ORDER BY](../../../sql-reference/statements/select/order-by.md) clauses **must** be calculated based on key expressions **or** on [aggregate functions](../../../sql-reference/aggregate-functions/index.md) over non-key expressions (including plain columns). In other words, each column selected from the table must be used either in a key expression or inside an aggregate function, but not both.
--   Result of aggregating `SELECT` query will contain as many rows as there were unique values of “grouping key” in source table. Usually, this significantly reduces the row count, often by orders of magnitude, but not necessarily: row count stays the same if all “grouping key” values were distinct.
+- `GROUP BY` clause contains a list of expressions (or a single expression, which is considered to be the list of length one). This list acts as a “grouping key”, while each individual expression will be referred to as a “key expression”.
+- All the expressions in the [SELECT](../../../sql-reference/statements/select/index.md), [HAVING](../../../sql-reference/statements/select/having.md), and [ORDER BY](../../../sql-reference/statements/select/order-by.md) clauses **must** be calculated based on key expressions **or** on [aggregate functions](../../../sql-reference/aggregate-functions/index.md) over non-key expressions (including plain columns). In other words, each column selected from the table must be used either in a key expression or inside an aggregate function, but not both.
+- Result of aggregating `SELECT` query will contain as many rows as there were unique values of “grouping key” in source table. Usually, this significantly reduces the row count, often by orders of magnitude, but not necessarily: row count stays the same if all “grouping key” values were distinct.
 
 When you want to group data in the table by column numbers instead of column names, enable the setting [enable_positional_arguments](../../../operations/settings/settings.md#enable-positional-arguments).
 
-:::note    
+:::note
 There’s an additional way to run aggregation over a table. If a query contains table columns only inside aggregate functions, the `GROUP BY clause` can be omitted, and aggregation by an empty set of keys is assumed. Such queries always return exactly one row.
 :::
 
@@ -57,8 +57,8 @@ The subtotals are calculated in the reverse order: at first subtotals are calcul
 
 In the subtotals rows the values of already "grouped" key expressions are set to `0` or empty line.
 
-:::note    
-Mind that [HAVING](../../../sql-reference/statements/select/having) clause can affect the subtotals results.
+:::note
+Mind that [HAVING](../../../sql-reference/statements/select/having.md) clause can affect the subtotals results.
 :::
 
 **Example**
@@ -125,8 +125,8 @@ SELECT year, month, day, count(*) FROM t GROUP BY year, month, day WITH ROLLUP;
 
 In the subtotals rows the values of all "grouped" key expressions are set to `0` or empty line.
 
-:::note    
-Mind that [HAVING](../../../sql-reference/statements/select/having) clause can affect the subtotals results.
+:::note
+Mind that [HAVING](../../../sql-reference/statements/select/having.md) clause can affect the subtotals results.
 :::
 
 **Example**
@@ -220,17 +220,17 @@ If the `WITH TOTALS` modifier is specified, another row will be calculated. This
 
 This extra row is only produced in `JSON*`, `TabSeparated*`, and `Pretty*` formats, separately from the other rows:
 
--   In `XML` and `JSON*` formats, this row is output as a separate ‘totals’ field.
--   In `TabSeparated*`, `CSV*` and `Vertical` formats, the row comes after the main result, preceded by an empty row (after the other data).
--   In `Pretty*` formats, the row is output as a separate table after the main result.
--   In `Template` format, the row is output according to specified template.
--   In the other formats it is not available.
+- In `XML` and `JSON*` formats, this row is output as a separate ‘totals’ field.
+- In `TabSeparated*`, `CSV*` and `Vertical` formats, the row comes after the main result, preceded by an empty row (after the other data).
+- In `Pretty*` formats, the row is output as a separate table after the main result.
+- In `Template` format, the row is output according to specified template.
+- In the other formats it is not available.
 
-:::note    
-totals is output in the results of `SELECT` queries, and is not output in `INSERT INTO ... SELECT`. 
+:::note
+totals is output in the results of `SELECT` queries, and is not output in `INSERT INTO ... SELECT`.
 :::
 
-`WITH TOTALS` can be run in different ways when [HAVING](../../../sql-reference/statements/select/having) is present. The behavior depends on the `totals_mode` setting.
+`WITH TOTALS` can be run in different ways when [HAVING](../../../sql-reference/statements/select/having.md) is present. The behavior depends on the `totals_mode` setting.
 
 ### Configuring Totals Processing
 
@@ -374,8 +374,9 @@ The aggregation can be performed more effectively, if a table is sorted by some 
 
 You can enable dumping temporary data to the disk to restrict memory usage during `GROUP BY`.
 The [max_bytes_before_external_group_by](../../../operations/settings/query-complexity.md#settings-max_bytes_before_external_group_by) setting determines the threshold RAM consumption for dumping `GROUP BY` temporary data to the file system. If set to 0 (the default), it is disabled.
+Alternatively, you can set [max_bytes_ratio_before_external_group_by](../../../operations/settings/query-complexity.md#settings-max_bytes_ratio_before_external_group_by), which allows to use `GROUP BY` in external memory only once the query reaches certain threshold of used memory.
 
-When using `max_bytes_before_external_group_by`, we recommend that you set `max_memory_usage` about twice as high. This is necessary because there are two stages to aggregation: reading the data and forming intermediate data (1) and merging the intermediate data (2). Dumping data to the file system can only occur during stage 1. If the temporary data wasn’t dumped, then stage 2 might require up to the same amount of memory as in stage 1.
+When using `max_bytes_before_external_group_by`, we recommend that you set `max_memory_usage` about twice as high (or `max_bytes_ratio_before_external_group_by=0.5`). This is necessary because there are two stages to aggregation: reading the data and forming intermediate data (1) and merging the intermediate data (2). Dumping data to the file system can only occur during stage 1. If the temporary data wasn’t dumped, then stage 2 might require up to the same amount of memory as in stage 1.
 
 For example, if [max_memory_usage](../../../operations/settings/query-complexity.md#settings_max_memory_usage) was set to 10000000000 and you want to use external aggregation, it makes sense to set `max_bytes_before_external_group_by` to 10000000000, and `max_memory_usage` to 20000000000. When external aggregation is triggered (if there was at least one dump of temporary data), maximum consumption of RAM is only slightly more than `max_bytes_before_external_group_by`.
 

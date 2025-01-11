@@ -4,23 +4,26 @@
 
 #include <base/errnoToString.h>
 #include <Common/assert_cast.h>
-#include <Common/Exception.h>
 #include <Common/MemorySanitizer.h>
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Stopwatch.h>
 #include <Common/setThreadName.h>
+#include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 #include <future>
+#include <memory>
 
 namespace ProfileEvents
 {
     extern const Event ReadBufferFromFileDescriptorRead;
     extern const Event ReadBufferFromFileDescriptorReadFailed;
     extern const Event ReadBufferFromFileDescriptorReadBytes;
+    extern const Event AsynchronousReaderIgnoredBytes;
 
     extern const Event IOUringSQEsSubmitted;
-    extern const Event IOUringSQEsResubmits;
+    extern const Event IOUringSQEsResubmitsAsync;
+    extern const Event IOUringSQEsResubmitsSync;
     extern const Event IOUringCQEsCompleted;
     extern const Event IOUringCQEsFailed;
 }
@@ -44,7 +47,7 @@ namespace ErrorCodes
 }
 
 IOUringReader::IOUringReader(uint32_t entries_)
- : log(&Poco::Logger::get("IOUringReader"))
+    : log(getLogger("IOUringReader"))
 {
     struct io_uring_probe * probe = io_uring_get_probe();
     if (!probe)
@@ -61,16 +64,24 @@ IOUringReader::IOUringReader(uint32_t entries_)
 
     struct io_uring_params params =
     {
+        .sq_entries = 0, // filled by the kernel, initializing to silence warning
         .cq_entries = 0, // filled by the kernel, initializing to silence warning
         .flags = 0,
+        .sq_thread_cpu = 0, // Unused (IORING_SETUP_SQ_AFF isn't set). Silences warning
+        .sq_thread_idle = 0, // Unused (IORING_SETUP_SQPOL isn't set). Silences warning
+        .features = 0, // filled by the kernel, initializing to silence warning
+        .wq_fd = 0, // Unused (IORING_SETUP_ATTACH_WQ isn't set). Silences warning.
+        .resv = {0, 0, 0}, // "The resv array must be initialized to zero."
+        .sq_off = {}, // filled by the kernel, initializing to silence warning
+        .cq_off = {}, // filled by the kernel, initializing to silence warning
     };
 
     int ret = io_uring_queue_init_params(entries_, &ring, &params);
     if (ret < 0)
-        throwFromErrno("Failed initializing io_uring", ErrorCodes::IO_URING_INIT_FAILED, -ret);
+        ErrnoException::throwWithErrno(ErrorCodes::IO_URING_INIT_FAILED, -ret, "Failed initializing io_uring");
 
     cq_entries = params.cq_entries;
-    ring_completion_monitor = ThreadFromGlobalPool([this] { monitorRing(); });
+    ring_completion_monitor = std::make_unique<ThreadFromGlobalPool>([this] { monitorRing(); });
 }
 
 std::future<IAsynchronousReader::Result> IOUringReader::submit(Request request)
@@ -110,19 +121,15 @@ std::future<IAsynchronousReader::Result> IOUringReader::submit(Request request)
             }
             return (kv->second).promise.get_future();
         }
-        else
-        {
-            ProfileEvents::increment(ProfileEvents::ReadBufferFromFileDescriptorReadFailed);
-            return makeFailedResult(Exception(
-                ErrorCodes::IO_URING_SUBMIT_ERROR, "Failed submitting SQE: {}", ret < 0 ? errnoToString(-ret) : "no SQE submitted"));
-        }
+
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromFileDescriptorReadFailed);
+        return makeFailedResult(
+            Exception(ErrorCodes::IO_URING_SUBMIT_ERROR, "Failed submitting SQE: {}", ret < 0 ? errnoToString(-ret) : "no SQE submitted"));
     }
-    else
-    {
-        CurrentMetrics::add(CurrentMetrics::IOUringPendingEvents);
-        pending_requests.push_back(std::move(enqueued_request));
-        return pending_requests.back().promise.get_future();
-    }
+
+    CurrentMetrics::add(CurrentMetrics::IOUringPendingEvents);
+    pending_requests.push_back(std::move(enqueued_request));
+    return pending_requests.back().promise.get_future();
 }
 
 int IOUringReader::submitToRing(EnqueuedRequest & enqueued)
@@ -139,10 +146,12 @@ int IOUringReader::submitToRing(EnqueuedRequest & enqueued)
     io_uring_prep_read(sqe, fd, request.buf, static_cast<unsigned>(request.size - enqueued.bytes_read), request.offset + enqueued.bytes_read);
     int ret = 0;
 
-    do
+    ret = io_uring_submit(&ring);
+    while (ret == -EINTR || ret == -EAGAIN)
     {
+        ProfileEvents::increment(ProfileEvents::IOUringSQEsResubmitsSync);
         ret = io_uring_submit(&ring);
-    } while (ret == -EINTR || ret == -EAGAIN);
+    }
 
     if (ret > 0 && !enqueued.resubmitting)
     {
@@ -256,7 +265,7 @@ void IOUringReader::monitorRing()
         if (cqe->res == -EAGAIN || cqe->res == -EINTR)
         {
             enqueued.resubmitting = true;
-            ProfileEvents::increment(ProfileEvents::IOUringSQEsResubmits);
+            ProfileEvents::increment(ProfileEvents::IOUringSQEsResubmitsAsync);
 
             ret = submitToRing(enqueued);
             if (ret <= 0)
@@ -300,6 +309,7 @@ void IOUringReader::monitorRing()
             // potential short read, re-submit
             enqueued.resubmitting = true;
             enqueued.bytes_read += bytes_read;
+            ProfileEvents::increment(ProfileEvents::IOUringSQEsResubmitsAsync);
 
             ret = submitToRing(enqueued);
             if (ret <= 0)
@@ -310,6 +320,7 @@ void IOUringReader::monitorRing()
         }
         else
         {
+            ProfileEvents::increment(ProfileEvents::AsynchronousReaderIgnoredBytes, enqueued.request.ignore);
             enqueued.promise.set_value(Result{ .size = total_bytes_read, .offset = enqueued.request.ignore });
             finalizeRequest(it);
         }
@@ -333,7 +344,7 @@ IOUringReader::~IOUringReader()
         io_uring_submit(&ring);
     }
 
-    ring_completion_monitor.join();
+    ring_completion_monitor->join();
 
     io_uring_queue_exit(&ring);
 }

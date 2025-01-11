@@ -22,19 +22,19 @@ namespace
 struct FilesystemAvailable
 {
     static constexpr auto name = "filesystemAvailable";
-    static std::uintmax_t get(const DiskPtr & disk) { return disk->getAvailableSpace(); }
+    static UInt64 get(const DiskPtr & disk) { return disk->getAvailableSpace().value_or(std::numeric_limits<UInt64>::max()); }
 };
 
 struct FilesystemUnreserved
 {
     static constexpr auto name = "filesystemUnreserved";
-    static std::uintmax_t get(const DiskPtr & disk) { return disk->getUnreservedSpace(); }
+    static UInt64 get(const DiskPtr & disk) { return disk->getUnreservedSpace().value_or(std::numeric_limits<UInt64>::max()); }
 };
 
 struct FilesystemCapacity
 {
     static constexpr auto name = "filesystemCapacity";
-    static std::uintmax_t get(const DiskPtr & disk) { return disk->getTotalSpace(); }
+    static UInt64 get(const DiskPtr & disk) { return disk->getTotalSpace().value_or(std::numeric_limits<UInt64>::max()); }
 };
 
 template <typename Impl>
@@ -82,28 +82,26 @@ public:
             auto disk = context->getDisk("default");
             return DataTypeUInt64().createColumnConst(input_rows_count, Impl::get(disk));
         }
-        else
-        {
-            auto col = arguments[0].column;
-            if (const ColumnString * col_str = checkAndGetColumn<ColumnString>(col.get()))
-            {
-                auto disk_map = context->getDisksMap();
 
-                auto col_res = ColumnVector<UInt64>::create(col_str->size());
-                auto & data = col_res->getData();
-                for (size_t i = 0; i < col_str->size(); ++i)
-                {
-                    auto disk_name = col_str->getDataAt(i).toString();
-                    if (auto it = disk_map.find(disk_name); it != disk_map.end())
-                        data[i] = Impl::get(it->second);
-                    else
-                        throw Exception(ErrorCodes::UNKNOWN_DISK, "Unknown disk name {} while execute function {}", disk_name, getName());
-                }
-                return col_res;
+        auto col = arguments[0].column;
+        if (const ColumnString * col_str = checkAndGetColumn<ColumnString>(col.get()))
+        {
+            auto disk_map = context->getDisksMap();
+
+            auto col_res = ColumnVector<UInt64>::create(col_str->size());
+            auto & data = col_res->getData();
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                auto disk_name = col_str->getDataAt(i).toString();
+                if (auto it = disk_map.find(disk_name); it != disk_map.end())
+                    data[i] = Impl::get(it->second);
+                else
+                    throw Exception(ErrorCodes::UNKNOWN_DISK, "Unknown disk name {} while execute function {}", disk_name, getName());
             }
-            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}",
-                arguments[0].column->getName(), getName());
+            return col_res;
         }
+        throw Exception(
+            ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", arguments[0].column->getName(), getName());
     }
 
 private:

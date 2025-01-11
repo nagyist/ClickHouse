@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <deque>
-#include <set>
 
 #include <fmt/core.h>
 #include <fmt/format.h>
@@ -33,9 +32,10 @@ struct MarkRange
 
 struct MarkRanges : public std::deque<MarkRange>
 {
-    using std::deque<MarkRange>::deque;
+    using std::deque<MarkRange>::deque; /// NOLINT(modernize-type-traits)
 
     size_t getNumberOfMarks() const;
+    bool isOneRangeForWholePart(size_t num_marks_in_part) const;
 
     void serialize(WriteBuffer & out) const;
     String describe() const;
@@ -63,14 +63,14 @@ struct fmt::formatter<DB::MarkRange>
 
         /// Only support {}.
         if (it != end && *it != '}')
-            throw format_error("invalid format");
+            throw fmt::format_error("invalid format");
 
         return it;
     }
 
     template <typename FormatContext>
-    auto format(const DB::MarkRange & range, FormatContext & ctx)
+    auto format(const DB::MarkRange & range, FormatContext & ctx) const
     {
-        return format_to(ctx.out(), "{}", fmt::format("({}, {})", range.begin, range.end));
+        return fmt::format_to(ctx.out(), "{}", fmt::format("({}, {})", range.begin, range.end));
     }
 };

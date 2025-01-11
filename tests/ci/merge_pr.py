@@ -4,7 +4,7 @@
 
 import argparse
 import logging
-
+import sys
 from datetime import datetime
 from os import getenv
 from pprint import pformat
@@ -14,11 +14,19 @@ from github.PaginatedList import PaginatedList
 from github.PullRequestReview import PullRequestReview
 from github.WorkflowRun import WorkflowRun
 
-from commit_status_helper import get_commit_filtered_statuses
+from ci_config import CI
+from commit_status_helper import (
+    get_commit,
+    get_commit_filtered_statuses,
+    trigger_mergeable_check,
+    update_upstream_sync_status,
+)
+from env_helper import GITHUB_REPOSITORY, GITHUB_UPSTREAM_REPOSITORY
 from get_robot_token import get_best_robot_token
 from github_helper import GitHub, NamedUser, PullRequest, Repository
 from pr_info import PRInfo
-
+from report import SUCCESS
+from synchronizer_utils import SYNC_BRANCH_PREFIX
 
 # The team name for accepted approvals
 TEAM_NAME = getenv("GITHUB_TEAM_NAME", "core")
@@ -47,7 +55,18 @@ class Reviews:
                 self.reviews[user] = r
                 continue
 
-            if r.submitted_at < self.reviews[user].submitted_at:
+            # Do not process other statuses than STATES for existing user keys
+            if r.state not in self.STATES:
+                continue
+
+            # If the user has a status other than STATES, we overwrite it by a
+            # review w/ a proper state w/o checking the date
+            if self.reviews[user].state not in self.STATES:
+                self.reviews[user] = r
+                continue
+
+            # Keep the latest review per user
+            if self.reviews[user].submitted_at < r.submitted_at:
                 self.reviews[user] = r
 
     def is_approved(self, team: List[NamedUser]) -> bool:
@@ -89,55 +108,52 @@ class Reviews:
             if review.state == "APPROVED"
         }
 
-        if approved:
+        if not approved:
             logging.info(
-                "The following users from %s team approved the PR: %s",
+                "The PR #%s is not approved by any of %s team member",
+                self.pr.number,
                 TEAM_NAME,
-                ", ".join(user.login for user in approved.keys()),
             )
-            # The only reliable place to get the 100% accurate last_modified
-            # info is when the commit was pushed to GitHub. The info is
-            # available as a header 'last-modified' of /{org}/{repo}/commits/{sha}.
-            # Unfortunately, it's formatted as 'Wed, 04 Jan 2023 11:05:13 GMT'
-
-            commit = self.pr.head.repo.get_commit(self.pr.head.sha)
-            if commit.stats.last_modified is None:
-                logging.warning(
-                    "Unable to get info about the commit %s", self.pr.head.sha
-                )
-                return False
-
-            last_changed = datetime.strptime(
-                commit.stats.last_modified, "%a, %d %b %Y %H:%M:%S GMT"
-            )
-
-            approved_at = max(review.submitted_at for review in approved.values())
-            if approved_at == datetime.fromtimestamp(0):
-                logging.info(
-                    "Unable to get `datetime.fromtimestamp(0)`, "
-                    "here's debug info about reviews: %s",
-                    "\n".join(pformat(review) for review in self.reviews.values()),
-                )
-            else:
-                logging.info(
-                    "The PR is approved at %s",
-                    approved_at.isoformat(),
-                )
-
-            if approved_at < last_changed:
-                logging.info(
-                    "There are changes after approve at %s",
-                    approved_at.isoformat(),
-                )
-                return False
-            return True
+            return False
 
         logging.info(
-            "The PR #%s is not approved by any of %s team member",
-            self.pr.number,
+            "The following users from %s team approved the PR: %s",
             TEAM_NAME,
+            ", ".join(user.login for user in approved.keys()),
         )
-        return False
+
+        # The only reliable place to get the 100% accurate last_modified
+        # info is when the commit was pushed to GitHub. The info is
+        # available as a header 'last-modified' of /{org}/{repo}/commits/{sha}.
+        # Unfortunately, it's formatted as 'Wed, 04 Jan 2023 11:05:13 GMT'
+        commit = self.pr.head.repo.get_commit(self.pr.head.sha)
+        if commit.stats.last_modified is None:
+            logging.warning("Unable to get info about the commit %s", self.pr.head.sha)
+            return False
+
+        last_changed = datetime.strptime(
+            commit.stats.last_modified, "%a, %d %b %Y %H:%M:%S GMT"
+        )
+        logging.info("The PR is changed at %s", last_changed.isoformat())
+
+        approved_at = max(review.submitted_at for review in approved.values())
+        if approved_at.timestamp() == 0:
+            logging.info(
+                "Unable to get `datetime.fromtimestamp(0)`, "
+                "here's debug info about reviews: %s",
+                "\n".join(pformat(review) for review in self.reviews.values()),
+            )
+        else:
+            logging.info("The PR is approved at %s", approved_at.isoformat())
+
+        if approved_at.timestamp() < last_changed.timestamp():
+            logging.info(
+                "There are changes done at %s after approval at %s",
+                last_changed.isoformat(),
+                approved_at.isoformat(),
+            )
+            return False
+        return True
 
 
 def get_workflows_for_head(repo: Repository, head_sha: str) -> List[WorkflowRun]:
@@ -146,7 +162,7 @@ def get_workflows_for_head(repo: Repository, head_sha: str) -> List[WorkflowRun]
     return list(
         PaginatedList(
             WorkflowRun,
-            repo._requester,  # type:ignore # pylint:disable=protected-access
+            repo._requester,  # pylint:disable=protected-access
             f"{repo.url}/actions/runs",
             {"head_sha": head_sha},
             list_item="workflow_runs",
@@ -165,6 +181,17 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="if set, the script won't merge the PR, just check the conditions",
+    )
+    parser.add_argument(
+        "--set-ci-status",
+        action="store_true",
+        help="if set, only update/set Mergeable Check status",
+    )
+    parser.add_argument(
+        "--wf-status",
+        type=str,
+        default="",
+        help="overall workflow status [success|failure]. used with --set-ci-status only",
     )
     parser.add_argument(
         "--check-approved",
@@ -217,13 +244,59 @@ def main():
     args = parse_args()
     logging.info("Going to process PR #%s in repo %s", args.pr, args.repo)
     token = args.token or get_best_robot_token()
-    gh = GitHub(token, per_page=100)
+    gh = GitHub(token)
     repo = gh.get_repo(args.repo)
+
+    if args.set_ci_status:
+        CI.GH.print_workflow_results()
+        # set Mergeable check status and exit
+        commit = get_commit(gh, args.pr_info.sha)
+        statuses = get_commit_filtered_statuses(commit)
+
+        has_failed_statuses = False
+        for status in statuses:
+            print(f"Check status [{status.context}], [{status.state}]")
+            if (
+                CI.is_required(status.context)
+                and status.state != SUCCESS
+                and status.context != CI.StatusNames.SYNC
+            ):
+                print(
+                    f"WARNING: Not success status [{status.context}], [{status.state}]"
+                )
+                has_failed_statuses = True
+
+        workflow_ok = CI.is_workflow_ok()
+        if workflow_ok or has_failed_statuses:
+            # set Mergeable Check if workflow is successful (green)
+            # or if we have GH statuses with failures (red)
+            #    to avoid false-green on a died runner
+            state = trigger_mergeable_check(
+                commit,
+                statuses,
+            )
+            # Process upstream StatusNames.SYNC
+            pr_info = PRInfo()
+            if (
+                pr_info.head_ref.startswith(f"{SYNC_BRANCH_PREFIX}/pr/")
+                and GITHUB_REPOSITORY != GITHUB_UPSTREAM_REPOSITORY
+            ):
+                print("Updating upstream statuses")
+                update_upstream_sync_status(pr_info, state)
+        else:
+            print(
+                "Workflow failed but no failed statuses found (died runner?) - cannot set Mergeable Check status"
+            )
+        if workflow_ok and not has_failed_statuses:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
     # An ugly and not nice fix to patch the wrong organization URL,
     # see https://github.com/PyGithub/PyGithub/issues/2395#issuecomment-1378629710
     # pylint: disable=protected-access
-    repo.organization._url.value = repo.organization.url.replace(  # type: ignore
-        "/users/", "/orgs/", 1
+    repo.organization._url = repo._makeStringAttribute(
+        repo.organization.url.replace("/users/", "/orgs/", 1)
     )
     # pylint: enable=protected-access
     pr = repo.get_pull(args.pr)
@@ -238,6 +311,12 @@ def main():
 
     if args.check_running_workflows:
         workflows = get_workflows_for_head(repo, pr.head.sha)
+        logging.info(
+            "The PR #%s has following workflows:\n%s",
+            pr.number,
+            "\n".join(f"{wf.html_url}: status is {wf.status}" for wf in workflows),
+        )
+
         workflows_in_progress = [wf for wf in workflows if wf.status != "completed"]
         # At most one workflow in progress is fine. We check that there no
         # cases like, e.g. PullRequestCI and DocksCheck in progress at once
@@ -255,7 +334,7 @@ def main():
         failed_statuses = [
             status.context
             for status in get_commit_filtered_statuses(commit)
-            if status.state != "success"
+            if status.state != SUCCESS
         ]
         if failed_statuses:
             logging.warning(

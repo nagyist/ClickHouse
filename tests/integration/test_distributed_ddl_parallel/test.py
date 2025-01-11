@@ -2,13 +2,16 @@
 # pylint: disable=redefined-outer-name
 # pylint: disable=line-too-long
 
-from functools import wraps
 import threading
 import time
+from functools import wraps
+
 import pytest
+
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
+
 
 # By default the exceptions that was throwed in threads will be ignored
 # (they will not mark the test as failed, only printed to stderr).

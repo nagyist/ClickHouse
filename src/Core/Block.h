@@ -5,13 +5,12 @@
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/NamesAndTypes.h>
 
-#include <Common/HashTable/HashMap.h>
-
 #include <initializer_list>
 #include <list>
-#include <map>
 #include <set>
 #include <vector>
+#include <sparsehash/dense_hash_map>
+#include <DataTypes/Serializations/SerializationInfo.h>
 
 
 namespace DB
@@ -69,6 +68,8 @@ public:
     }
 
     const ColumnWithTypeAndName * findByName(const std::string & name, bool case_insensitive = false) const;
+    std::optional<ColumnWithTypeAndName> findSubcolumnByName(const std::string & name) const;
+    std::optional<ColumnWithTypeAndName> findColumnOrSubcolumnByName(const std::string & name) const;
 
     ColumnWithTypeAndName & getByName(const std::string & name, bool case_insensitive = false)
     {
@@ -77,6 +78,8 @@ public:
     }
 
     const ColumnWithTypeAndName & getByName(const std::string & name, bool case_insensitive = false) const;
+    ColumnWithTypeAndName getSubcolumnByName(const std::string & name) const;
+    ColumnWithTypeAndName getColumnOrSubcolumnByName(const std::string & name) const;
 
     Container::iterator begin() { return data.begin(); }
     Container::iterator end() { return data.end(); }
@@ -97,10 +100,11 @@ public:
     Names getDataTypeNames() const;
 
     /// Hash table match `column name -> position in the block`.
-    using NameMap = HashMap<StringRef, size_t, StringRefHash>;
+    using NameMap = ::google::dense_hash_map<StringRef, size_t, StringRefHash>;
     NameMap getNamesToIndexesMap() const;
 
     Serializations getSerializations() const;
+    Serializations getSerializations(const SerializationInfoByName & hints) const;
 
     /// Returns number of rows from first column in block, not equal to nullptr. If no columns, returns 0.
     size_t rows() const;
@@ -141,6 +145,9 @@ public:
     /** Get empty columns with the same types as in block. */
     MutableColumns cloneEmptyColumns() const;
 
+    /** Get empty columns with the same types as in block and given serializations. */
+    MutableColumns cloneEmptyColumns(const Serializations & serializations) const;
+
     /** Get columns from block for mutation. Columns in block will be nullptr. */
     MutableColumns mutateColumns();
 
@@ -150,6 +157,13 @@ public:
 
     /** Get a block with columns that have been rearranged in the order of their names. */
     Block sortColumns() const;
+
+    /** See IColumn::shrinkToFit() */
+    Block shrinkToFit() const;
+
+    Block compress() const;
+
+    Block decompress() const;
 
     void clear();
     void swap(Block & other) noexcept;
@@ -176,7 +190,6 @@ using BlockPtr = std::shared_ptr<Block>;
 using Blocks = std::vector<Block>;
 using BlocksList = std::list<Block>;
 using BlocksPtr = std::shared_ptr<Blocks>;
-using BlocksPtrs = std::shared_ptr<std::vector<BlocksPtr>>;
 
 /// Extends block with extra data in derived classes
 struct ExtraBlock

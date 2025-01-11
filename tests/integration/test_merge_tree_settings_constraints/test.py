@@ -1,10 +1,12 @@
-import pytest
 import asyncio
-import re
-import random
 import os.path
+import random
+import re
+
+import pytest
+
 from helpers.cluster import ClickHouseCluster
-from helpers.test_tools import assert_eq_with_retry, TSV
+from helpers.test_tools import TSV, assert_eq_with_retry
 
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance("instance", user_configs=["users.xml"])
@@ -20,7 +22,6 @@ def start_cluster():
 
 
 def test_merge_tree_settings_constraints():
-
     assert "Setting storage_policy should not be changed" in instance.query_and_get_error(
         f"CREATE TABLE wrong_table (number Int64) engine = MergeTree() ORDER BY number SETTINGS storage_policy = 'secret_policy'"
     )

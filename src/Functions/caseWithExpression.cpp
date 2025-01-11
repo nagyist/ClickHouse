@@ -24,6 +24,9 @@ public:
 
     explicit FunctionCaseWithExpression(ContextPtr context_) : context(context_) {}
     bool isVariadic() const override { return true; }
+    bool useDefaultImplementationForConstants() const override { return false; }
+    bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override { return false; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
     String getName() const override { return name; }
@@ -90,13 +93,12 @@ public:
 
         auto fun_array = FunctionFactory::instance().get("array", context);
 
-        src_array_col.column = fun_array->build(src_array_elems)->execute(src_array_elems, src_array_type, input_rows_count);
-        dst_array_col.column = fun_array->build(dst_array_elems)->execute(dst_array_elems, dst_array_type, input_rows_count);
+        src_array_col.column = fun_array->build(src_array_elems)->execute(src_array_elems, src_array_type, input_rows_count, /* dry_run = */ false);
+        dst_array_col.column = fun_array->build(dst_array_elems)->execute(dst_array_elems, dst_array_type, input_rows_count, /* dry_run = */ false);
 
         /// Execute transform.
         ColumnsWithTypeAndName transform_args{args.front(), src_array_col, dst_array_col, args.back()};
-        return FunctionFactory::instance().get("transform", context)->build(transform_args)
-            ->execute(transform_args, result_type, input_rows_count);
+        return FunctionFactory::instance().get("transform", context)->build(transform_args)->execute(transform_args, result_type, input_rows_count, /* dry_run = */ false);
     }
 
 private:
@@ -110,9 +112,7 @@ REGISTER_FUNCTION(CaseWithExpression)
     factory.registerFunction<FunctionCaseWithExpression>();
 
     /// These are obsolete function names.
-    factory.registerFunction<FunctionCaseWithExpression>("caseWithExpr");
+    factory.registerAlias("caseWithExpr", "caseWithExpression");
 }
 
 }
-
-

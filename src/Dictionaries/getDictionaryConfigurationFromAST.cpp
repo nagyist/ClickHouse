@@ -16,9 +16,11 @@
 #include <Parsers/ASTFunctionWithKeyValueArguments.h>
 #include <Parsers/ASTDictionaryAttributeDeclaration.h>
 #include <Dictionaries/DictionaryFactory.h>
+#include <Dictionaries/DictionarySourceFactory.h>
 #include <Functions/FunctionFactory.h>
 #include <Common/isLocalAddress.h>
 #include <Interpreters/Context.h>
+#include <DataTypes/DataTypeFactory.h>
 
 
 namespace DB
@@ -156,11 +158,11 @@ void buildLayoutConfiguration(
 
         const auto value_field = value_literal->value;
 
-        if (value_field.getType() != Field::Types::UInt64 && value_field.getType() != Field::Types::String)
+        if (value_field.getType() != Field::Types::UInt64 && value_field.getType() != Field::Types::Float64 && value_field.getType() != Field::Types::String)
         {
             throw DB::Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "Dictionary layout parameter value must be an UInt64 or String, got '{}' instead",
+                "Dictionary layout parameter value must be an UInt64, Float64 or String, got '{}' instead",
                 value_field.getTypeName());
         }
 
@@ -322,7 +324,7 @@ void buildSingleAttribute(
 
 
 /** Transforms
-  *   PRIMARY KEY Attr1 ,..., AttrN
+  *   PRIMARY KEY Attr1, ..., AttrN
   * to the next configuration
   *  <id><name>Attr1</name></id>
   * or
@@ -380,6 +382,15 @@ void buildPrimaryKeyConfiguration(
         name_element->appendChild(name);
 
         buildAttributeExpressionIfNeeded(doc, id_element, dict_attr);
+
+        if (!dict_attr->type)
+            return;
+
+        AutoPtr<Element> type_element(doc->createElement("type"));
+        id_element->appendChild(type_element);
+
+        AutoPtr<Text> type(doc->createTextNode(queryToString(dict_attr->type)));
+        type_element->appendChild(type);
     }
     else
     {
@@ -473,8 +484,13 @@ void buildConfigurationFromFunctionWithKeyValueArguments(
             /// It's not possible to have a function in a dictionary definition since 22.10,
             /// because query must be normalized on dictionary creation. It's possible only when we load old metadata.
             /// For debug builds allow it only during server startup to avoid crash in BC check in Stress Tests.
-            assert(Context::getGlobalContextInstance()->getApplicationType() != Context::ApplicationType::SERVER
-                   || !Context::getGlobalContextInstance()->isServerCompletelyStarted());
+            if (Context::getGlobalContextInstance()->getApplicationType() == Context::ApplicationType::SERVER &&
+                Context::getGlobalContextInstance()->isServerCompletelyStarted())
+            {
+                throw Exception(ErrorCodes::INCORRECT_DICTIONARY_DEFINITION,
+                    "The dictionary definition contains unsupported elements. "
+                    "Please update the dictionary definition to remove function usage");
+            }
             auto builder = FunctionFactory::instance().tryGet(func->name, context);
             auto function = builder->build({});
             function->prepare({});
@@ -482,7 +498,7 @@ void buildConfigurationFromFunctionWithKeyValueArguments(
             /// We assume that function will not take arguments and will return constant value like tcpPort or hostName
             /// Such functions will return column with size equal to input_rows_count.
             size_t input_rows_count = 1;
-            auto result = function->execute({}, function->getResultType(), input_rows_count);
+            auto result = function->execute({}, function->getResultType(), input_rows_count, /* dry_run = */ false);
 
             Field value;
             result->get(0, value);
@@ -517,8 +533,11 @@ void buildSourceConfiguration(
     AutoPtr<Element> root,
     const ASTFunctionWithKeyValueArguments * source,
     const ASTDictionarySettings * settings,
+    const String & dictionary_name,
     ContextPtr context)
 {
+    DictionarySourceFactory::instance().checkSourceAvailable(source->name, dictionary_name, context);
+
     AutoPtr<Element> outer_element(doc->createElement("source"));
     root->appendChild(outer_element);
     AutoPtr<Element> source_element(doc->createElement(source->name));
@@ -571,11 +590,28 @@ void checkPrimaryKey(const AttributeNameToConfiguration & all_attrs, const Names
 
 }
 
+void checkLifetime(const ASTCreateQuery & query)
+{
+    if (query.dictionary->layout && query.dictionary->layout->layout_type == "direct")
+    {
+        if (query.dictionary->lifetime)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "'lifetime' parameter is redundant for the dictionary' of layout '{}'",
+                query.dictionary->layout->layout_type);
+    }
+}
+
 
 DictionaryConfigurationPtr
 getDictionaryConfigurationFromAST(const ASTCreateQuery & query, ContextPtr context, const std::string & database_)
 {
     checkAST(query);
+    checkLifetime(query);
+
+    String dictionary_name = query.getTable();
+    String db_name = !database_.empty() ? database_ : query.getDatabase();
+    String full_dictionary_name = (!db_name.empty() ? (db_name + ".") : "") + dictionary_name;
 
     AutoPtr<Poco::XML::Document> xml_document(new Poco::XML::Document());
     AutoPtr<Poco::XML::Element> document_root(xml_document->createElement("dictionaries"));
@@ -586,12 +622,12 @@ getDictionaryConfigurationFromAST(const ASTCreateQuery & query, ContextPtr conte
 
     AutoPtr<Poco::XML::Element> name_element(xml_document->createElement("name"));
     current_dictionary->appendChild(name_element);
-    AutoPtr<Text> name(xml_document->createTextNode(query.getTable()));
+    AutoPtr<Text> name(xml_document->createTextNode(dictionary_name));
     name_element->appendChild(name);
 
     AutoPtr<Poco::XML::Element> database_element(xml_document->createElement("database"));
     current_dictionary->appendChild(database_element);
-    AutoPtr<Text> database(xml_document->createTextNode(!database_.empty() ? database_ : query.getDatabase()));
+    AutoPtr<Text> database(xml_document->createTextNode(db_name));
     database_element->appendChild(database);
 
     if (query.uuid != UUIDHelpers::Nil)
@@ -614,10 +650,20 @@ getDictionaryConfigurationFromAST(const ASTCreateQuery & query, ContextPtr conte
 
     checkPrimaryKey(all_attr_names_and_types, pk_attrs);
 
+    /// If the pk size is 1 and pk's DataType is not number, we should convert to complex.
+    /// NOTE: the data type of Numeric key(simple layout) is UInt64, so if the type is not under UInt64, type casting will lead to precision loss.
+    DataTypePtr first_key_type = DataTypeFactory::instance().get(all_attr_names_and_types.find(pk_attrs[0])->second.type);
+    if ((pk_attrs.size() > 1 || (pk_attrs.size() == 1 && !isNumber(first_key_type)))
+        && !complex
+        && DictionaryFactory::instance().convertToComplex(dictionary_layout->layout_type))
+    {
+        complex = true;
+    }
+
     buildPrimaryKeyConfiguration(xml_document, structure_element, complex, pk_attrs, query.dictionary_attributes_list);
 
     buildLayoutConfiguration(xml_document, current_dictionary, query.dictionary->dict_settings, dictionary_layout);
-    buildSourceConfiguration(xml_document, current_dictionary, query.dictionary->source, query.dictionary->dict_settings, context);
+    buildSourceConfiguration(xml_document, current_dictionary, query.dictionary->source, query.dictionary->dict_settings, full_dictionary_name, context);
     buildLifetimeConfiguration(xml_document, current_dictionary, query.dictionary->lifetime);
 
     if (query.dictionary->range)
@@ -649,10 +695,12 @@ getInfoIfClickHouseDictionarySource(DictionaryConfigurationPtr & config, Context
     String database = config->getString("dictionary.source.clickhouse.db", "");
     String table = config->getString("dictionary.source.clickhouse.table", "");
 
-    if (table.empty())
-        return {};
+    info.query = config->getString("dictionary.source.clickhouse.query", "");
 
-    info.table_name = {database, table};
+    if (!table.empty())
+        info.table_name = {database, table};
+    else if (info.query.empty())
+        return {};
 
     try
     {

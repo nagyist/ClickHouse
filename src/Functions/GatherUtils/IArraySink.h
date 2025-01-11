@@ -24,12 +24,9 @@ struct IArraySink
     }
 };
 
-#pragma GCC visibility push(hidden)
-
 template <typename Derived>
-class ArraySinkImpl : public Visitable<Derived, IArraySink, ArraySinkVisitor> {};
+class ArraySinkImpl : public Visitable<Derived, IArraySink, ArraySinkVisitor> {};  /// NOLINT(bugprone-crtp-constructor-accessibility)
 
-#pragma GCC visibility pop
 }
 
 }

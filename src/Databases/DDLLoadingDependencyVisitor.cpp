@@ -1,12 +1,19 @@
 #include <Databases/DDLLoadingDependencyVisitor.h>
+#include <Databases/DDLDependencyVisitor.h>
 #include <Dictionaries/getDictionaryConfigurationFromAST.h>
+#include "config.h"
+#if USE_LIBPQXX
+#include <Storages/PostgreSQL/StorageMaterializedPostgreSQL.h>
+#endif
 #include <Interpreters/Context.h>
 #include <Interpreters/misc.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTTTLElement.h>
 #include <Poco/String.h>
 
 
@@ -15,13 +22,15 @@ namespace DB
 
 using TableLoadingDependenciesVisitor = DDLLoadingDependencyVisitor::Visitor;
 
-TableNamesSet getLoadingDependenciesFromCreateQuery(ContextPtr global_context, const QualifiedTableName & table, const ASTPtr & ast)
+TableNamesSet getLoadingDependenciesFromCreateQuery(ContextPtr global_context, const QualifiedTableName & table, const ASTPtr & ast, bool can_throw)
 {
     assert(global_context == global_context->getGlobalContext());
     TableLoadingDependenciesVisitor::Data data;
     data.default_database = global_context->getCurrentDatabase();
     data.create_query = ast;
     data.global_context = global_context;
+    data.table_name = table;
+    data.can_throw = can_throw;
     TableLoadingDependenciesVisitor visitor{data};
     visitor.visit(ast);
     data.dependencies.erase(table);
@@ -106,19 +115,47 @@ void DDLLoadingDependencyVisitor::visit(const ASTFunctionWithKeyValueArguments &
     if (!info || !info->is_local)
         return;
 
-    if (info->table_name.database.empty())
-        info->table_name.database = data.default_database;
-    data.dependencies.emplace(std::move(info->table_name));
+    if (!info->table_name.table.empty())
+    {
+        /// If database is not specified in dictionary source, use database of the dictionary itself, not the current/default database.
+        if (info->table_name.database.empty())
+            info->table_name.database = data.table_name.database;
+        data.dependencies.emplace(std::move(info->table_name));
+    }
+    else
+    {
+        /// We don't have a table name, we have a select query instead that will be executed during dictionary loading.
+        /// We need to find all tables used in this select query and add them to dependencies.
+        auto select_query_dependencies = getDependenciesFromDictionaryNestedSelectQuery(data.global_context, data.table_name, data.create_query, info->query, data.default_database, data.can_throw);
+        data.dependencies.merge(select_query_dependencies);
+    }
 }
 
 void DDLLoadingDependencyVisitor::visit(const ASTStorage & storage, Data & data)
 {
+    if (storage.ttl_table)
+    {
+        auto ttl_dependensies = getDependenciesFromCreateQuery(data.global_context, data.table_name, storage.ttl_table->ptr(), data.default_database);
+        data.dependencies.merge(ttl_dependensies);
+    }
+
     if (!storage.engine)
         return;
-    if (storage.engine->name != "Dictionary")
-        return;
 
-    extractTableNameFromArgument(*storage.engine, data, 0);
+    if (storage.engine->name == "Distributed")
+        /// Checks that dict* expression was used as sharding_key and builds dependency between the dictionary and current table.
+        /// Distributed(logs, default, hits[, sharding_key[, policy_name]])
+        extractTableNameFromArgument(*storage.engine, data, 3);
+    else if (storage.engine->name == "Dictionary")
+        extractTableNameFromArgument(*storage.engine, data, 0);
+#if USE_LIBPQXX
+    else if (storage.engine->name == "MaterializedPostgreSQL")
+    {
+        const auto * create_query = data.create_query->as<ASTCreateQuery>();
+        auto nested_table = toString(create_query->uuid) + StorageMaterializedPostgreSQL::NESTED_TABLE_SUFFIX;
+        data.dependencies.emplace(QualifiedTableName{ .database = create_query->getDatabase(), .table = nested_table });
+    }
+#endif
 }
 
 
@@ -131,12 +168,34 @@ void DDLLoadingDependencyVisitor::extractTableNameFromArgument(const ASTFunction
     QualifiedTableName qualified_name;
 
     const auto * arg = function.arguments->as<ASTExpressionList>()->children[arg_idx].get();
-    if (const auto * literal = arg->as<ASTLiteral>())
+
+    if (const auto * function_arg = arg->as<ASTFunction>())
+    {
+        if (!functionIsJoinGet(function_arg->name) && !functionIsDictGet(function_arg->name))
+            return;
+
+        /// Get the dictionary name from `dict*` function or the table name from 'joinGet' function.
+        const auto * literal_arg = function_arg->arguments->as<ASTExpressionList>()->children[0].get();
+        const auto * name = literal_arg->as<ASTLiteral>();
+
+        if (!name)
+            return;
+
+        if (name->value.getType() != Field::Types::String)
+            return;
+
+        auto maybe_qualified_name = QualifiedTableName::tryParseFromString(name->value.safeGet<String>());
+        if (!maybe_qualified_name)
+            return;
+
+        qualified_name = std::move(*maybe_qualified_name);
+    }
+    else if (const auto * literal = arg->as<ASTLiteral>())
     {
         if (literal->value.getType() != Field::Types::String)
             return;
 
-        auto maybe_qualified_name = QualifiedTableName::tryParseFromString(literal->value.get<String>());
+        auto maybe_qualified_name = QualifiedTableName::tryParseFromString(literal->value.safeGet<String>());
         /// Just return if name if invalid
         if (!maybe_qualified_name)
             return;
@@ -154,6 +213,13 @@ void DDLLoadingDependencyVisitor::extractTableNameFromArgument(const ASTFunction
         qualified_name.database = table_identifier->getDatabaseName();
         qualified_name.table = table_identifier->shortName();
     }
+    else if (arg->as<ASTSubquery>())
+    {
+        /// Allow IN subquery.
+        /// Do not add tables from the subquery into dependencies,
+        /// because CREATE will succeed anyway.
+        return;
+    }
     else
     {
         assert(false);
@@ -167,5 +233,4 @@ void DDLLoadingDependencyVisitor::extractTableNameFromArgument(const ASTFunction
     }
     data.dependencies.emplace(std::move(qualified_name));
 }
-
 }

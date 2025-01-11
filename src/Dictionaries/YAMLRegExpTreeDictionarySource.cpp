@@ -54,7 +54,6 @@ inline const String kYAMLRegExpTree = "yamlregexptree";
 
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
     extern const int SUPPORT_IS_DISABLED;
     extern const int INCORRECT_DICTIONARY_DEFINITION;
     extern const int CANNOT_OPEN_FILE;
@@ -77,7 +76,7 @@ void registerDictionarySourceYAMLRegExpTree(DictionarySourceFactory & factory)
         if (dict_struct.has_expressions)
         {
             throw Exception(
-                ErrorCodes::LOGICAL_ERROR, "Dictionary source of type `{}` does not support attribute expressions", kYAMLRegExpTree);
+                ErrorCodes::SUPPORT_IS_DISABLED, "Dictionary source of type `{}` does not support attribute expressions", kYAMLRegExpTree);
         }
 
         if (!dict_struct.key.has_value() || dict_struct.key.value().size() != 1 || (*dict_struct.key)[0].type->getName() != "String")
@@ -227,25 +226,25 @@ void parseMatchNode(UInt64 parent_id, UInt64 & id, const YAML::Node & node, Resu
 
     if (!match.contains(key_name))
     {
-        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Yaml match rule must contain key {}", key_name);
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "YAML match rule must contain key {}", key_name);
     }
-    for (const auto & [key, node] : match)
+    for (const auto & [key, node_] : match)
     {
         if (key == key_name)
         {
-            if (!node.IsScalar())
+            if (!node_.IsScalar())
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "`{}` should be a String", key_name);
 
-            attributes_to_insert.reg_exp = node.as<String>();
+            attributes_to_insert.reg_exp = node_.as<String>();
         }
         else if (structure.hasAttribute(key))
         {
             attributes_to_insert.keys.push_back(key);
-            attributes_to_insert.values.push_back(node.as<String>());
+            attributes_to_insert.values.push_back(node_.as<String>());
         }
-        else if (node.IsSequence())
+        else if (node_.IsSequence())
         {
-            parseMatchList(attributes_to_insert.id, id, node, result, key_name, structure);
+            parseMatchList(attributes_to_insert.id, id, node_, result, key_name, structure);
         }
         /// unknown attributes.
     }
@@ -284,7 +283,7 @@ Block parseYAMLAsRegExpTree(const YAML::Node & node, const String & key_name, co
 
 YAMLRegExpTreeDictionarySource::YAMLRegExpTreeDictionarySource(
     const String & filepath_, const DictionaryStructure & dict_struct, ContextPtr context_, bool created_from_ddl)
-    : filepath(filepath_), structure(dict_struct), context(context_), logger(&Poco::Logger::get(kYAMLRegExpTreeDictionarySource))
+    : filepath(filepath_), structure(dict_struct), context(context_), logger(getLogger(kYAMLRegExpTreeDictionarySource))
 {
     key_name = (*structure.key)[0].name;
 

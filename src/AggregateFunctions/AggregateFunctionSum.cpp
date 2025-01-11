@@ -19,7 +19,7 @@ namespace
 template <typename T>
 struct SumSimple
 {
-    /// @note It uses slow Decimal128 (cause we need such a variant). sumWithOverflow is faster for Decimal32/64
+    /// @note It uses slow Decimal128/256 (cause we need such a variant). sumWithOverflow is faster for Decimal32/64
     using ResultType = std::conditional_t<is_decimal<T>,
                                         std::conditional_t<std::is_same_v<T, Decimal256>, Decimal256, Decimal128>,
                                         NearestFieldType<T>>;
@@ -72,7 +72,7 @@ AggregateFunctionPtr createAggregateFunctionSum(const std::string & name, const 
 
 void registerAggregateFunctionSum(AggregateFunctionFactory & factory)
 {
-    factory.registerFunction("sum", createAggregateFunctionSum<AggregateFunctionSumSimple>, AggregateFunctionFactory::CaseInsensitive);
+    factory.registerFunction("sum", createAggregateFunctionSum<AggregateFunctionSumSimple>, AggregateFunctionFactory::Case::Insensitive);
     factory.registerFunction("sumWithOverflow", createAggregateFunctionSum<AggregateFunctionSumWithOverflow>);
     factory.registerFunction("sumKahan", createAggregateFunctionSum<AggregateFunctionSumKahan>);
 }

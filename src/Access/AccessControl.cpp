@@ -6,6 +6,7 @@
 #include <Access/DiskAccessStorage.h>
 #include <Access/LDAPAccessStorage.h>
 #include <Access/ContextAccess.h>
+#include <Access/EnabledSettings.h>
 #include <Access/EnabledRolesInfo.h>
 #include <Access/RoleCache.h>
 #include <Access/RowPolicyCache.h>
@@ -20,12 +21,13 @@
 #include <Backups/BackupEntriesCollector.h>
 #include <Backups/RestorerFromBackup.h>
 #include <Core/Settings.h>
-#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <base/defines.h>
+#include <base/range.h>
 #include <IO/Operators.h>
+#include <Common/re2.h>
+
 #include <Poco/AccessExpireCache.h>
 #include <boost/algorithm/string/join.hpp>
-#include <re2/re2.h>
 #include <filesystem>
 #include <mutex>
 
@@ -37,6 +39,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_ELEMENT_IN_CONFIG;
     extern const int UNKNOWN_SETTING;
     extern const int AUTHENTICATION_FAILED;
+    extern const int REQUIRED_PASSWORD;
     extern const int CANNOT_COMPILE_REGEXP;
     extern const int BAD_ARGUMENTS;
 }
@@ -47,7 +50,7 @@ namespace
         const Poco::Util::AbstractConfiguration & config,
         const std::string & config_path,
         const std::string & users_config_path,
-        Poco::Logger * log)
+        LoggerPtr log)
     {
         if (config.getBool("skip_check_for_incorrect_settings", false))
             return;
@@ -76,11 +79,13 @@ public:
         auto x = cache.get(params);
         if (x)
         {
-            if ((*x)->tryGetUser())
+            if ((*x)->getUserID() && !(*x)->tryGetUser())
+                cache.remove(params); /// The user has been dropped while it was in the cache.
+            else
                 return *x;
-            /// No user, probably the user has been dropped while it was in the cache.
-            cache.remove(params);
         }
+
+        /// TODO: There is no need to keep the `ContextAccessCache::mutex` locked while we're calculating access rights.
         auto res = std::make_shared<ContextAccess>(access_control, params);
         res->initialize();
         cache.add(params, res);
@@ -131,8 +136,8 @@ public:
                             "' registered for user-defined settings",
                             String{setting_name}, boost::algorithm::join(registered_prefixes, "' or '"));
         }
-        else
-            BaseSettingsHelpers::throwSettingNotFound(setting_name);
+
+        throw Exception(ErrorCodes::UNKNOWN_SETTING, "Unknown setting '{}'", String{setting_name});
     }
 
 private:
@@ -247,7 +252,7 @@ private:
 AccessControl::AccessControl()
     : MultipleAccessStorage("user directories"),
       context_access_cache(std::make_unique<ContextAccessCache>(*this)),
-      role_cache(std::make_unique<RoleCache>(*this)),
+      role_cache(std::make_unique<RoleCache>(*this, 600)),
       row_policy_cache(std::make_unique<RowPolicyCache>(*this)),
       quota_cache(std::make_unique<QuotaCache>(*this)),
       settings_profiles_cache(std::make_unique<SettingsProfilesCache>(*this)),
@@ -259,10 +264,27 @@ AccessControl::AccessControl()
 }
 
 
-AccessControl::~AccessControl() = default;
+AccessControl::~AccessControl()
+{
+    try
+    {
+        AccessControl::shutdown();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+    }
+}
 
 
-void AccessControl::setUpFromMainConfig(const Poco::Util::AbstractConfiguration & config_, const String & config_path_,
+void AccessControl::shutdown()
+{
+    MultipleAccessStorage::shutdown();
+    removeAllStorages();
+}
+
+
+void AccessControl::setupFromMainConfig(const Poco::Util::AbstractConfiguration & config_, const String & config_path_,
                                         const zkutil::GetZooKeeper & get_zookeeper_function_)
 {
     if (config_.has("custom_settings_prefixes"))
@@ -271,17 +293,23 @@ void AccessControl::setUpFromMainConfig(const Poco::Util::AbstractConfiguration 
     setImplicitNoPasswordAllowed(config_.getBool("allow_implicit_no_password", true));
     setNoPasswordAllowed(config_.getBool("allow_no_password", true));
     setPlaintextPasswordAllowed(config_.getBool("allow_plaintext_password", true));
+    setDefaultPasswordTypeFromConfig(config_.getString("default_password_type", "sha256_password"));
     setPasswordComplexityRulesFromConfig(config_);
+
+    setBcryptWorkfactor(config_.getInt("bcrypt_workfactor", 12));
 
     /// Optional improvements in access control system.
     /// The default values are false because we need to be compatible with earlier access configurations
-    setEnabledUsersWithoutRowPoliciesCanReadRows(config_.getBool("access_control_improvements.users_without_row_policies_can_read_rows", false));
-    setOnClusterQueriesRequireClusterGrant(config_.getBool("access_control_improvements.on_cluster_queries_require_cluster_grant", false));
-    setSelectFromSystemDatabaseRequiresGrant(config_.getBool("access_control_improvements.select_from_system_db_requires_grant", false));
-    setSelectFromInformationSchemaRequiresGrant(config_.getBool("access_control_improvements.select_from_information_schema_requires_grant", false));
-    setSettingsConstraintsReplacePrevious(config_.getBool("access_control_improvements.settings_constraints_replace_previous", false));
+    setEnabledUsersWithoutRowPoliciesCanReadRows(config_.getBool("access_control_improvements.users_without_row_policies_can_read_rows", true));
+    setOnClusterQueriesRequireClusterGrant(config_.getBool("access_control_improvements.on_cluster_queries_require_cluster_grant", true));
+    setSelectFromSystemDatabaseRequiresGrant(config_.getBool("access_control_improvements.select_from_system_db_requires_grant", true));
+    setSelectFromInformationSchemaRequiresGrant(config_.getBool("access_control_improvements.select_from_information_schema_requires_grant", true));
+    setSettingsConstraintsReplacePrevious(config_.getBool("access_control_improvements.settings_constraints_replace_previous", true));
+    setTableEnginesRequireGrant(config_.getBool("access_control_improvements.table_engines_require_grant", false));
 
     addStoragesFromMainConfig(config_, config_path_, get_zookeeper_function_);
+
+    role_cache = std::make_unique<RoleCache>(*this, config_.getInt("access_control_improvements.role_cache_expiration_time_seconds", 600));
 }
 
 
@@ -410,7 +438,7 @@ void AccessControl::addStoragesFromUserDirectoriesConfig(
         String type = key_in_user_directories;
         if (size_t bracket_pos = type.find('['); bracket_pos != String::npos)
             type.resize(bracket_pos);
-        if ((type == "users_xml") || (type == "users_config"))
+        if ((type == "users.xml") || (type == "users_config"))
             type = UsersConfigAccessStorage::STORAGE_TYPE;
         else if ((type == "local") || (type == "local_directory"))
             type = DiskAccessStorage::STORAGE_TYPE;
@@ -520,12 +548,14 @@ scope_guard AccessControl::subscribeForChanges(const std::vector<UUID> & ids, co
     return changes_notifier->subscribeForChanges(ids, handler);
 }
 
-std::optional<UUID> AccessControl::insertImpl(const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists)
+bool AccessControl::insertImpl(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists, UUID * conflicting_id)
 {
-    auto id = MultipleAccessStorage::insertImpl(entity, replace_if_exists, throw_if_exists);
-    if (id)
+    if (MultipleAccessStorage::insertImpl(id, entity, replace_if_exists, throw_if_exists, conflicting_id))
+    {
         changes_notifier->sendNotifications();
-    return id;
+        return true;
+    }
+    return false;
 }
 
 bool AccessControl::removeImpl(const UUID & id, bool throw_if_not_exists)
@@ -550,16 +580,39 @@ AccessChangesNotifier & AccessControl::getChangesNotifier()
 }
 
 
-UUID AccessControl::authenticate(const Credentials & credentials, const Poco::Net::IPAddress & address) const
+AuthResult AccessControl::authenticate(const Credentials & credentials, const Poco::Net::IPAddress & address, const String & forwarded_address) const
 {
+    // NOTE: In the case where the user has never been logged in using LDAP,
+    // Then user_id is not generated, and the authentication quota will always be nullptr.
+    auto authentication_quota = getAuthenticationQuota(credentials.getUserName(), address, forwarded_address);
+    if (authentication_quota)
+    {
+        /// Reserve a single try from the quota to check whether we have another authentication try.
+        /// This is required for correct behavior in this situation:
+        /// User has 1 login failures quota.
+        /// * At the first login with an invalid password: Increase the quota counter. 1 (used) > 1 (max) is false.
+        ///   Then try to authenticate the user and throw an AUTHENTICATION_FAILED error.
+        /// * In case of the second try: increase quota counter, 2 (used) > 1 (max), then throw QUOTA_EXCEED
+        ///   and don't let the user authenticate.
+        ///
+        /// The authentication failures counter will be reset after successful authentication.
+        authentication_quota->used(QuotaType::FAILED_SEQUENTIAL_AUTHENTICATIONS, 1);
+    }
+
     try
     {
-        return MultipleAccessStorage::authenticate(credentials, address, *external_authenticators, allow_no_password,
-                                                   allow_plaintext_password);
+        const auto auth_result = MultipleAccessStorage::authenticate(credentials, address, *external_authenticators, allow_no_password,
+                                                                     allow_plaintext_password);
+        if (authentication_quota)
+            authentication_quota->reset(QuotaType::FAILED_SEQUENTIAL_AUTHENTICATIONS);
+
+        return auth_result;
     }
     catch (...)
     {
-        tryLogCurrentException(getLogger(), "from: " + address.toString() + ", user: " + credentials.getUserName()  + ": Authentication failed");
+        tryLogCurrentException(getLogger(), "from: " + address.toString() + ", user: " + credentials.getUserName()  + ": Authentication failed", LogsLevel::information);
+
+        int error_code = ErrorCodes::AUTHENTICATION_FAILED;
 
         WriteBufferFromOwnString message;
         message << credentials.getUserName() << ": Authentication failed: password is incorrect, or there is no user with such name.";
@@ -567,23 +620,33 @@ UUID AccessControl::authenticate(const Credentials & credentials, const Poco::Ne
         /// Better exception message for usability.
         /// It is typical when users install ClickHouse, type some password and instantly forget it.
         if (credentials.getUserName().empty() || credentials.getUserName() == "default")
-            message << "\n\n"
-                << "If you have installed ClickHouse and forgot password you can reset it in the configuration file.\n"
-                << "The password for default user is typically located at /etc/clickhouse-server/users.d/default-password.xml\n"
-                << "and deleting this file will reset the password.\n"
-                << "See also /etc/clickhouse-server/users.xml on the server where ClickHouse is installed.\n\n";
+        {
+            error_code = ErrorCodes::REQUIRED_PASSWORD;
+            message << R"(
 
-        /// We use the same message for all authentication failures because we don't want to give away any unnecessary information for security reasons,
-        /// only the log will show the exact reason.
+If you use ClickHouse Cloud, the password can be reset at https://clickhouse.cloud/
+on the settings page for the corresponding service.
+
+If you have installed ClickHouse and forgot password you can reset it in the configuration file.
+The password for default user is typically located at /etc/clickhouse-server/users.d/default-password.xml
+and deleting this file will reset the password.
+See also /etc/clickhouse-server/users.xml on the server where ClickHouse is installed.
+
+)";
+        }
+
+        /// We use the same message for all authentication failures because we don't want to give away any unnecessary information for security reasons.
+        /// Only the log ((*), above) will show the exact reason. Note that (*) logs at information level instead of the default error level as
+        /// authentication failures are not an unusual event.
         throw Exception(PreformattedMessage{message.str(),
-                                            "{}: Authentication failed: password is incorrect, or there is no user with such name.{}"},
-                        ErrorCodes::AUTHENTICATION_FAILED);
+            "{}: Authentication failed: password is incorrect, or there is no user with such name",
+            std::vector<std::string>{credentials.getUserName()}}, error_code);
     }
 }
 
-void AccessControl::restoreFromBackup(RestorerFromBackup & restorer)
+void AccessControl::restoreFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup)
 {
-    MultipleAccessStorage::restoreFromBackup(restorer);
+    MultipleAccessStorage::restoreFromBackup(restorer, data_path_in_backup);
     changes_notifier->sendNotifications();
 }
 
@@ -651,6 +714,27 @@ bool AccessControl::isPlaintextPasswordAllowed() const
     return allow_plaintext_password;
 }
 
+void AccessControl::setDefaultPasswordTypeFromConfig(const String & type_)
+{
+    for (auto check_type : collections::range(AuthenticationType::MAX))
+    {
+        const auto & info = AuthenticationTypeInfo::get(check_type);
+
+        if (type_ == info.name && info.is_password)
+        {
+            default_password_type = check_type;
+            return;
+        }
+    }
+
+    throw Exception(ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG, "Unknown password type in 'default_password_type' in config");
+}
+
+AuthenticationType AccessControl::getDefaultPasswordType() const
+{
+    return default_password_type;
+}
+
 void AccessControl::setPasswordComplexityRulesFromConfig(const Poco::Util::AbstractConfiguration & config_)
 {
     password_rules->setPasswordComplexityRulesFromConfig(config_);
@@ -671,33 +755,19 @@ std::vector<std::pair<String, String>> AccessControl::getPasswordComplexityRules
     return password_rules->getPasswordComplexityRules();
 }
 
-
-std::shared_ptr<const ContextAccess> AccessControl::getContextAccess(
-    const UUID & user_id,
-    const std::vector<UUID> & current_roles,
-    bool use_default_roles,
-    const Settings & settings,
-    const String & current_database,
-    const ClientInfo & client_info) const
+void AccessControl::setBcryptWorkfactor(int workfactor_)
 {
-    ContextAccessParams params;
-    params.user_id = user_id;
-    params.current_roles.insert(current_roles.begin(), current_roles.end());
-    params.use_default_roles = use_default_roles;
-    params.current_database = current_database;
-    params.readonly = settings.readonly;
-    params.allow_ddl = settings.allow_ddl;
-    params.allow_introspection = settings.allow_introspection_functions;
-    params.interface = client_info.interface;
-    params.http_method = client_info.http_method;
-    params.address = client_info.current_address.host();
-    params.quota_key = client_info.quota_key;
+    if (workfactor_ < 4)
+        bcrypt_workfactor = 4;
+    else if (workfactor_ > 31)
+        bcrypt_workfactor = 31;
+    else
+        bcrypt_workfactor = workfactor_;
+}
 
-    /// Extract the last entry from comma separated list of X-Forwarded-For addresses.
-    /// Only the last proxy can be trusted (if any).
-    params.forwarded_address = client_info.getLastForwardedFor();
-
-    return getContextAccess(params);
+int AccessControl::getBcryptWorkfactor() const
+{
+    return bcrypt_workfactor;
 }
 
 
@@ -712,6 +782,14 @@ std::shared_ptr<const EnabledRoles> AccessControl::getEnabledRoles(
     const std::vector<UUID> & current_roles_with_admin_option) const
 {
     return role_cache->getEnabledRoles(current_roles, current_roles_with_admin_option);
+}
+
+
+std::shared_ptr<const EnabledRolesInfo> AccessControl::getEnabledRolesInfo(
+    const std::vector<UUID> & current_roles,
+    const std::vector<UUID> & current_roles_with_admin_option) const
+{
+    return getEnabledRoles(current_roles, current_roles_with_admin_option)->getRolesInfo();
 }
 
 
@@ -739,7 +817,33 @@ std::shared_ptr<const EnabledQuota> AccessControl::getEnabledQuota(
     const String & forwarded_address,
     const String & custom_quota_key) const
 {
-    return quota_cache->getEnabledQuota(user_id, user_name, enabled_roles, address, forwarded_address, custom_quota_key);
+    return quota_cache->getEnabledQuota(user_id, user_name, enabled_roles, address, forwarded_address, custom_quota_key, true);
+}
+
+std::shared_ptr<const EnabledQuota> AccessControl::getAuthenticationQuota(
+    const String & user_name, const Poco::Net::IPAddress & address, const std::string & forwarded_address) const
+{
+    auto user_id = find<User>(user_name);
+    UserPtr user;
+    if (user_id && (user = tryRead<User>(*user_id)))
+    {
+        const auto new_current_roles = user->granted_roles.findGranted(user->default_roles);
+        const auto roles_info = getEnabledRolesInfo(new_current_roles, {});
+
+        // client_key is not received at the moment of authentication during TCP connection
+        // if key type is set to QuotaKeyType::CLIENT_KEY
+        // QuotaCache::QuotaInfo::calculateKey will throw exception without throw_if_client_key_empty = false
+        String quota_key;
+        bool throw_if_client_key_empty = false;
+        return quota_cache->getEnabledQuota(*user_id,
+                                            user->getName(),
+                                            roles_info->enabled_roles,
+                                            address,
+                                            forwarded_address,
+                                            quota_key,
+                                            throw_if_client_key_empty);
+    }
+    return nullptr;
 }
 
 
@@ -758,6 +862,15 @@ std::shared_ptr<const EnabledSettings> AccessControl::getEnabledSettings(
     return settings_profiles_cache->getEnabledSettings(user_id, settings_from_user, enabled_roles, settings_from_enabled_roles);
 }
 
+std::shared_ptr<const SettingsProfilesInfo> AccessControl::getEnabledSettingsInfo(
+    const UUID & user_id,
+    const SettingsProfileElements & settings_from_user,
+    const boost::container::flat_set<UUID> & enabled_roles,
+    const SettingsProfileElements & settings_from_enabled_roles) const
+{
+    return getEnabledSettings(user_id, settings_from_user, enabled_roles, settings_from_enabled_roles)->getInfo();
+}
+
 std::shared_ptr<const SettingsProfilesInfo> AccessControl::getSettingsProfileInfo(const UUID & profile_id)
 {
     return settings_profiles_cache->getSettingsProfileInfo(profile_id);
@@ -769,4 +882,34 @@ const ExternalAuthenticators & AccessControl::getExternalAuthenticators() const
     return *external_authenticators;
 }
 
+
+void AccessControl::allowAllSettings()
+{
+    custom_settings_prefixes->registerPrefixes({""});
+}
+
+void AccessControl::setAllowTierSettings(UInt32 value)
+{
+    allow_experimental_tier_settings = value == 0;
+    allow_beta_tier_settings = value <= 1;
+}
+
+UInt32 AccessControl::getAllowTierSettings() const
+{
+    if (allow_experimental_tier_settings)
+        return 0;
+    if (allow_beta_tier_settings)
+        return 1;
+    return 2;
+}
+
+bool AccessControl::getAllowExperimentalTierSettings() const
+{
+    return allow_experimental_tier_settings;
+}
+
+bool AccessControl::getAllowBetaTierSettings() const
+{
+    return allow_beta_tier_settings;
+}
 }

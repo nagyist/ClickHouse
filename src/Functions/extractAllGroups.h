@@ -14,11 +14,13 @@
 #include <string>
 #include <vector>
 
-#include <Core/iostream_debug_helpers.h>
-
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsUInt64 regexp_max_matches_per_row;
+}
 
 namespace ErrorCodes
 {
@@ -27,7 +29,7 @@ namespace ErrorCodes
 }
 
 
-enum class ExtractAllGroupsResultKind
+enum class ExtractAllGroupsResultKind : uint8_t
 {
     VERTICAL,
     HORIZONTAL
@@ -73,10 +75,10 @@ public:
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
         FunctionArgumentDescriptors args{
-            {"haystack", &isStringOrFixedString<IDataType>, nullptr, "const String or const FixedString"},
-            {"needle", &isStringOrFixedString<IDataType>, isColumnConst, "const String or const FixedString"},
+            {"haystack", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isStringOrFixedString), nullptr, "const String or const FixedString"},
+            {"needle", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isStringOrFixedString), isColumnConst, "const String or const FixedString"},
         };
-        validateFunctionArgumentTypes(*this, arguments, args);
+        validateFunctionArguments(*this, arguments, args);
 
         /// Two-dimensional array of strings, each `row` of top array represents matching groups.
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()));
@@ -94,8 +96,7 @@ public:
         if (needle.empty())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Length of 'needle' argument must be greater than 0.");
 
-        using StringPiece = typename Regexps::Regexp::StringPieceType;
-        const Regexps::Regexp holder = Regexps::createRegexp<false, false, false>(needle);
+        const OptimizedRegularExpression holder = Regexps::createRegexp<false, false, false>(needle);
         const auto & regexp = holder.getRE2();
 
         if (!regexp)
@@ -111,7 +112,7 @@ public:
                             groups_count, std::to_string(MAX_GROUPS_COUNT - 1));
 
         // Including 0-group, which is the whole regexp.
-        PODArrayWithStackMemory<StringPiece, MAX_GROUPS_COUNT> matched_groups(groups_count + 1);
+        PODArrayWithStackMemory<std::string_view, MAX_GROUPS_COUNT> matched_groups(groups_count + 1);
 
         ColumnArray::ColumnOffsets::MutablePtr root_offsets_col = ColumnArray::ColumnOffsets::create();
         ColumnArray::ColumnOffsets::MutablePtr nested_offsets_col = ColumnArray::ColumnOffsets::create();
@@ -135,7 +136,7 @@ public:
                 const auto * end = pos + current_row.size();
                 while (pos < end
                     && regexp->Match({pos, static_cast<size_t>(end - pos)},
-                        0, end - pos, regexp->UNANCHORED,
+                        0, end - pos, RE2::UNANCHORED,
                         matched_groups.data(), static_cast<int>(matched_groups.size())))
                 {
                     // 1 is to exclude group #0 which is whole re match.
@@ -158,9 +159,9 @@ public:
         else
         {
             /// Additional limit to fail fast on supposedly incorrect usage.
-            const auto max_matches_per_row = context->getSettingsRef().regexp_max_matches_per_row;
+            const auto max_matches_per_row = context->getSettingsRef()[Setting::regexp_max_matches_per_row];
 
-            PODArray<StringPiece, 0> all_matches;
+            PODArray<std::string_view, 0> all_matches;
             /// Number of times RE matched on each row of haystack column.
             PODArray<size_t, 0> number_of_matches_per_row;
 
@@ -179,7 +180,7 @@ public:
                 const auto * end = pos + current_row.size;
                 while (pos < end
                     && regexp->Match({pos, static_cast<size_t>(end - pos)},
-                        0, end - pos, regexp->UNANCHORED, matched_groups.data(),
+                        0, end - pos, RE2::UNANCHORED, matched_groups.data(),
                         static_cast<int>(matched_groups.size())))
                 {
                     // 1 is to exclude group #0 which is whole re match.

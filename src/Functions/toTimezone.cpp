@@ -5,12 +5,19 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/extractTimeZoneFromFunctionArguments.h>
 
+#include <Interpreters/Context.h>
+
 #include <IO/WriteHelpers.h>
 #include <Common/assert_cast.h>
-
+#include <Core/Settings.h>
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool allow_nonconst_timezone_arguments;
+}
+
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
@@ -85,7 +92,10 @@ public:
     String getName() const override { return name; }
 
     size_t getNumberOfArguments() const override { return 2; }
-    static FunctionOverloadResolverPtr create(ContextPtr) { return std::make_unique<ToTimeZoneOverloadResolver>(); }
+    static FunctionOverloadResolverPtr create(ContextPtr context) { return std::make_unique<ToTimeZoneOverloadResolver>(context); }
+    explicit ToTimeZoneOverloadResolver(ContextPtr context)
+        : allow_nonconst_timezone_arguments(context->getSettingsRef()[Setting::allow_nonconst_timezone_arguments])
+    {}
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -99,7 +109,8 @@ public:
             throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument of function {}. "
                 "Should be DateTime or DateTime64", arguments[0].type->getName(), getName());
 
-        String time_zone_name = extractTimeZoneNameFromFunctionArguments(arguments, 1, 0);
+        String time_zone_name = extractTimeZoneNameFromFunctionArguments(arguments, 1, 0, allow_nonconst_timezone_arguments);
+
         if (which_type.isDateTime())
             return std::make_shared<DataTypeDateTime>(time_zone_name);
 
@@ -119,6 +130,8 @@ public:
 
         return std::make_unique<FunctionBaseToTimeZone>(is_constant_timezone, data_types, result_type);
     }
+private:
+    const bool allow_nonconst_timezone_arguments;
 };
 
 }

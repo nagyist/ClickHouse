@@ -10,7 +10,7 @@
 #include <Parsers/ASTQueryParameter.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTInterpolateElement.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Common/StringUtils.h>
 #include <Common/quoteString.h>
 #include <IO/WriteHelpers.h>
 
@@ -68,6 +68,10 @@ private:
 
 void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
 {
+    /// We do handle cycles via tracking current_asts
+    /// but in case of bug in that tricky logic we need to prevent stack overflow
+    checkStackSize();
+
     auto & current_asts = data.current_asts;
     String & current_alias = data.current_alias;
 
@@ -81,10 +85,10 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
     }
 
     /// If it is an alias, but not a parent alias (for constructs like "SELECT column + 1 AS column").
-    auto it_alias = data.aliases.find(node.name());
     if (!data.allow_self_aliases && current_alias == node.name())
         throw Exception(ErrorCodes::CYCLIC_ALIASES, "Self referencing of {} to {}. Cyclic alias",
                         backQuote(current_alias), backQuote(node.name()));
+    auto it_alias = data.aliases.find(node.name());
 
     if (it_alias != data.aliases.end() && current_alias != node.name())
     {
@@ -118,6 +122,15 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
                 alias_node->checkSize(data.settings.max_expanded_ast_elements);
                 ast = alias_node->clone();
                 ast->setAlias(node_alias);
+
+                /// If the cloned AST was finished, this one should also be considered finished
+                if (data.finished_asts.contains(alias_node))
+                    data.finished_asts[ast] = ast;
+
+                /// If we had an alias for node_alias, point it instead to the new node so we don't have to revisit it
+                /// on subsequent calls
+                if (auto existing_alias = data.aliases.find(node_alias); existing_alias != data.aliases.end())
+                    existing_alias->second = ast;
             }
         }
         else
@@ -127,6 +140,15 @@ void QueryNormalizer::visit(ASTIdentifier & node, ASTPtr & ast, Data & data)
             auto alias_name = ast->getAliasOrColumnName();
             ast = alias_node->clone();
             ast->setAlias(alias_name);
+
+            /// If the cloned AST was finished, this one should also be considered finished
+            if (data.finished_asts.contains(alias_node))
+                data.finished_asts[ast] = ast;
+
+            /// If we had an alias for node_alias, point it instead to the new node so we don't have to revisit it
+            /// on subsequent calls
+            if (auto existing_alias = data.aliases.find(node_alias); existing_alias != data.aliases.end())
+                existing_alias->second = ast;
         }
     }
 }
@@ -139,7 +161,13 @@ void QueryNormalizer::visit(ASTTablesInSelectQueryElement & node, const ASTPtr &
     {
         auto & join = node.table_join->as<ASTTableJoin &>();
         if (join.on_expression)
+        {
+            ASTPtr original_on_expression = join.on_expression;
             visit(join.on_expression, data);
+            if (join.on_expression != original_on_expression)
+                join.children = { join.on_expression };
+        }
+
     }
 }
 

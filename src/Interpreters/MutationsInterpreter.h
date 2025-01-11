@@ -19,8 +19,8 @@ using QueryPipelineBuilderPtr = std::unique_ptr<QueryPipelineBuilder>;
 
 /// Return false if the data isn't going to be changed by mutations.
 bool isStorageTouchedByMutations(
-    MergeTreeData & storage,
     MergeTreeData::DataPartPtr source_part,
+    MergeTreeData::MutationsSnapshotPtr mutations_snapshot,
     const StorageMetadataPtr & metadata_snapshot,
     const std::vector<MutationCommand> & commands,
     ContextPtr context
@@ -32,34 +32,50 @@ ASTPtr getPartitionAndPredicateExpressionForMutationCommand(
     ContextPtr context
 );
 
+MutationCommand createCommandToApplyDeletedMask(const MutationCommand & command);
+
 /// Create an input stream that will read data from storage and apply mutation commands (UPDATEs, DELETEs, MATERIALIZEs)
 /// to this data.
 class MutationsInterpreter
 {
+private:
     struct Stage;
-
 public:
+    struct Settings
+    {
+        explicit Settings(bool can_execute_) : can_execute(can_execute_) {}
+
+        /// If false only analyze mutation expressions.
+        bool can_execute = false;
+        /// Whether all columns should be returned, not just updated
+        bool return_all_columns = false;
+        /// Whether we should return mutated or all existing rows
+        bool return_mutated_rows = false;
+        /// Where we should filter deleted rows by lightweight DELETE.
+        bool apply_deleted_mask = true;
+        /// Where we should recalculate skip indexes, TTL expressions, etc. that depend on updated columns.
+        bool recalculate_dependencies_of_updated_columns = true;
+    };
+
     /// Storage to mutate, array of mutations commands and context. If you really want to execute mutation
     /// use can_execute = true, in other cases (validation, amount of commands) it can be false
     MutationsInterpreter(
         StoragePtr storage_,
-        const StorageMetadataPtr & metadata_snapshot_,
+        StorageMetadataPtr metadata_snapshot_,
         MutationCommands commands_,
         ContextPtr context_,
-        bool can_execute_,
-        bool return_all_columns_ = false,
-        bool return_deleted_rows_ = false);
+        Settings settings_);
 
-    /// Special case for MergeTree
+    /// Special case for *MergeTree
     MutationsInterpreter(
         MergeTreeData & storage_,
         MergeTreeData::DataPartPtr source_part_,
-        const StorageMetadataPtr & metadata_snapshot_,
+        AlterConversionsPtr alter_conversions_,
+        StorageMetadataPtr metadata_snapshot_,
         MutationCommands commands_,
+        Names available_columns_,
         ContextPtr context_,
-        bool can_execute_,
-        bool return_all_columns_ = false,
-        bool return_deleted_rows_ = false);
+        Settings settings_);
 
     void validate();
     size_t evaluateCommandsSize();
@@ -77,6 +93,8 @@ public:
 
     NameSet grabMaterializedIndices() { return std::move(materialized_indices); }
 
+    NameSet grabMaterializedStatistics() { return std::move(materialized_statistics); }
+
     NameSet grabMaterializedProjections() { return std::move(materialized_projections); }
 
     struct MutationKind
@@ -84,7 +102,7 @@ public:
         enum MutationKindEnum
         {
             MUTATE_UNKNOWN,
-            MUTATE_INDEX_PROJECTION,
+            MUTATE_INDEX_STATISTICS_PROJECTION,
             MUTATE_OTHER,
         } mutation_kind = MUTATE_UNKNOWN;
 
@@ -92,8 +110,6 @@ public:
     };
 
     MutationKind::MutationKindEnum getMutationKind() const { return mutation_kind.mutation_kind; }
-
-    void setApplyDeletedMask(bool apply) { apply_deleted_mask = apply; }
 
     /// Internal class which represents a data part for MergeTree
     /// or just storage for other storages.
@@ -106,8 +122,11 @@ public:
         const MergeTreeData * getMergeTreeData() const;
 
         bool supportsLightweightDelete() const;
-        bool hasLightweightDeleteMask() const;
         bool materializeTTLRecalculateOnly() const;
+        bool hasSecondaryIndex(const String & name) const;
+        bool hasProjection(const String & name) const;
+        bool hasBrokenProjection(const String & name) const;
+        bool isCompactPart() const;
 
         void read(
             Stage & first_stage,
@@ -118,25 +137,25 @@ public:
             bool can_execute_) const;
 
         explicit Source(StoragePtr storage_);
-        Source(MergeTreeData & storage_, MergeTreeData::DataPartPtr source_part_);
+        Source(MergeTreeData & storage_, MergeTreeData::DataPartPtr source_part_, AlterConversionsPtr alter_conversions_);
 
     private:
         StoragePtr storage;
 
-        /// Special case for MergeTree.
+        /// Special case for *MergeTree.
         MergeTreeData * data = nullptr;
         MergeTreeData::DataPartPtr part;
+        AlterConversionsPtr alter_conversions;
     };
 
 private:
     MutationsInterpreter(
         Source source_,
-        const StorageMetadataPtr & metadata_snapshot_,
+        StorageMetadataPtr metadata_snapshot_,
         MutationCommands commands_,
+        Names available_columns_,
         ContextPtr context_,
-        bool can_execute_,
-        bool return_all_columns_,
-        bool return_deleted_rows_);
+        Settings settings_);
 
     void prepare(bool dry_run);
 
@@ -151,11 +170,17 @@ private:
     Source source;
     StorageMetadataPtr metadata_snapshot;
     MutationCommands commands;
+
+    /// List of columns in table or in data part that can be updated by mutation.
+    /// If mutation affects all columns (e.g. DELETE), all of this columns
+    /// must be returned by pipeline created in MutationsInterpreter.
+    Names available_columns;
+
     ContextPtr context;
-    bool can_execute;
+    Settings settings;
     SelectQueryOptions select_limits;
 
-    bool apply_deleted_mask = true;
+    LoggerPtr logger;
 
     /// A sequence of mutation commands is executed as a sequence of stages. Each stage consists of several
     /// filters, followed by updating values of some columns. Commands can reuse expressions calculated by the
@@ -198,20 +223,16 @@ private:
     std::unique_ptr<Block> updated_header;
     std::vector<Stage> stages;
     bool is_prepared = false; /// Has the sequence of stages been prepared.
+    bool deleted_mask_updated = false;
 
     NameSet materialized_indices;
     NameSet materialized_projections;
+    NameSet materialized_statistics;
 
     MutationKind mutation_kind; /// Do we meet any index or projection mutation.
 
     /// Columns, that we need to read for calculation of skip indices, projections or TTL expressions.
     ColumnDependencies dependencies;
-
-    // whether all columns should be returned, not just updated
-    bool return_all_columns;
-
-    // whether we should return deleted or nondeleted rows on DELETE mutation
-    bool return_deleted_rows;
 };
 
 }

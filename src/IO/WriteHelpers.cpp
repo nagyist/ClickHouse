@@ -1,12 +1,21 @@
 #include <IO/WriteHelpers.h>
-#include <cinttypes>
-#include <utility>
+#include <base/DecomposedFloat.h>
+#include <base/hex.h>
 #include <Common/formatIPv6.h>
-#include <Common/hex.h>
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#pragma clang diagnostic ignored "-Wsign-compare"
+#include <dragonbox/dragonbox_to_chars.h>
+#pragma clang diagnostic pop
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+extern const int CANNOT_PRINT_FLOAT_OR_DOUBLE_NUMBER;
+}
 
 template <typename IteratorSrc, typename IteratorDst>
 void formatHex(IteratorSrc src, IteratorDst dst, size_t num_bytes)
@@ -20,20 +29,28 @@ void formatHex(IteratorSrc src, IteratorDst dst, size_t num_bytes)
     }
 }
 
-/** Function used when byte ordering is important when parsing uuid
- *  ex: When we create an UUID type
- */
-void formatUUID(std::reverse_iterator<const UInt8 *> src16, UInt8 * dst36)
+std::array<char, 36> formatUUID(const UUID & uuid)
 {
-    formatHex(src16 + 8, &dst36[0], 4);
-    dst36[8] = '-';
-    formatHex(src16 + 12, &dst36[9], 2);
-    dst36[13] = '-';
-    formatHex(src16 + 14, &dst36[14], 2);
-    dst36[18] = '-';
-    formatHex(src16, &dst36[19], 2);
-    dst36[23] = '-';
-    formatHex(src16 + 2, &dst36[24], 6);
+    std::array<char, 36> dst;
+    auto * dst_ptr = dst.data();
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const auto * src_ptr = reinterpret_cast<const UInt8 *>(&uuid);
+    const std::reverse_iterator src(src_ptr + 16);
+#else
+    const auto * src = reinterpret_cast<const UInt8 *>(&uuid);
+#endif
+    formatHex(src + 8, dst_ptr, 4);
+    dst[8] = '-';
+    formatHex(src + 12, dst_ptr + 9, 2);
+    dst[13] = '-';
+    formatHex(src + 14, dst_ptr + 14, 2);
+    dst[18] = '-';
+    formatHex(src, dst_ptr + 19, 2);
+    dst[23] = '-';
+    formatHex(src + 2, dst_ptr + 24, 6);
+
+    return dst;
 }
 
 void writeIPv4Text(const IPv4 & ip, WriteBuffer & buf)
@@ -62,7 +79,7 @@ void writeIPv6Text(const IPv6 & ip, WriteBuffer & buf)
 
 void writeException(const Exception & e, WriteBuffer & buf, bool with_stack_trace)
 {
-    writeBinary(e.code(), buf);
+    writeBinaryLittleEndian(e.code(), buf);
     writeBinary(String(e.name()), buf);
     writeBinary(e.displayText() + getExtraExceptionInfo(e), buf);
 
@@ -83,7 +100,8 @@ static inline void writeProbablyQuotedStringImpl(StringRef s, WriteBuffer & buf,
     if (isValidIdentifier(s.toView())
         /// This are valid identifiers but are problematic if present unquoted in SQL query.
         && !(s.size == strlen("distinct") && 0 == strncasecmp(s.data, "distinct", strlen("distinct")))
-        && !(s.size == strlen("all") && 0 == strncasecmp(s.data, "all", strlen("all"))))
+        && !(s.size == strlen("all") && 0 == strncasecmp(s.data, "all", strlen("all")))
+        && !(s.size == strlen("table") && 0 == strncasecmp(s.data, "table", strlen("table"))))
     {
         writeString(s, buf);
     }
@@ -93,17 +111,17 @@ static inline void writeProbablyQuotedStringImpl(StringRef s, WriteBuffer & buf,
 
 void writeProbablyBackQuotedString(StringRef s, WriteBuffer & buf)
 {
-    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { return writeBackQuotedString(s_, buf_); });
+    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { writeBackQuotedString(s_, buf_); });
 }
 
 void writeProbablyDoubleQuotedString(StringRef s, WriteBuffer & buf)
 {
-    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { return writeDoubleQuotedString(s_, buf_); });
+    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { writeDoubleQuotedString(s_, buf_); });
 }
 
 void writeProbablyBackQuotedStringMySQL(StringRef s, WriteBuffer & buf)
 {
-    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { return writeBackQuotedStringMySQL(s_, buf_); });
+    writeProbablyQuotedStringImpl(s, buf, [](StringRef s_, WriteBuffer & buf_) { writeBackQuotedStringMySQL(s_, buf_); });
 }
 
 void writePointerHex(const void * ptr, WriteBuffer & buf)
@@ -114,4 +132,42 @@ void writePointerHex(const void * ptr, WriteBuffer & buf)
     buf.write(hex_str, 2 * sizeof(ptr));
 }
 
+String fourSpaceIndent(size_t indent)
+{
+    return std::string(indent * 4, ' ');
+}
+
+template <typename T>
+requires is_floating_point<T>
+size_t writeFloatTextFastPath(T x, char * buffer)
+{
+    Int64 result = 0;
+
+    if constexpr (std::is_same_v<T, Float64>)
+    {
+        /// The library dragonbox has low performance on integers.
+        /// This workaround improves performance 6..10 times.
+
+        if (DecomposedFloat64(x).isIntegerInRepresentableRange())
+            result = itoa(Int64(x), buffer) - buffer;
+        else
+            result = jkj::dragonbox::to_chars_n(x, buffer) - buffer;
+    }
+    else if constexpr (std::is_same_v<T, Float32> || std::is_same_v<T, BFloat16>)
+    {
+        Float32 f32 = Float32(x);
+        if (DecomposedFloat32(f32).isIntegerInRepresentableRange())
+            result = itoa(Int32(f32), buffer) - buffer;
+        else
+            result = jkj::dragonbox::to_chars_n(f32, buffer) - buffer;
+    }
+
+    if (result <= 0)
+        throw Exception(ErrorCodes::CANNOT_PRINT_FLOAT_OR_DOUBLE_NUMBER, "Cannot print floating point number");
+    return result;
+}
+
+template size_t writeFloatTextFastPath(Float64 x, char * buffer);
+template size_t writeFloatTextFastPath(Float32 x, char * buffer);
+template size_t writeFloatTextFastPath(BFloat16 x, char * buffer);
 }

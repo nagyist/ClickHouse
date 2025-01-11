@@ -18,7 +18,9 @@
 #define Net_HTTPResponse_INCLUDED
 
 
+#include <map>
 #include <vector>
+
 #include "Poco/Net/HTTPCookie.h"
 #include "Poco/Net/HTTPMessage.h"
 #include "Poco/Net/Net.h"
@@ -180,6 +182,8 @@ namespace Net
         /// May throw an exception in case of a malformed
         /// Set-Cookie header.
 
+        void getHeaders(std::map<std::string, std::string> & headers) const;
+
         void write(std::ostream & ostr) const;
         /// Writes the HTTP response to the given
         /// output stream.
@@ -188,14 +192,10 @@ namespace Net
         /// Writes the HTTP response to the given
         /// output stream, but do not finish with \r\n delimiter.
 
-#if __clang__
 #    pragma clang diagnostic push
 #    pragma clang diagnostic ignored "-Woverloaded-virtual"
-#endif
         void read(std::istream & istr);
-#if __clang__
 #    pragma clang diagnostic pop
-#endif
         /// Reads the HTTP response from the
         /// given input stream.
         ///

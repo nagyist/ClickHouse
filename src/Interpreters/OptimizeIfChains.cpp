@@ -64,6 +64,7 @@ ASTs OptimizeIfChainsVisitor::ifChain(const ASTPtr & child)
         throw Exception(ErrorCodes::UNEXPECTED_AST_STRUCTURE, "Unexpected AST for function 'if'");
 
     const auto * function_args = function_node->arguments->as<ASTExpressionList>();
+    chassert(function_args);
 
     if (!function_args || function_args->children.size() != 3)
         throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
@@ -82,15 +83,13 @@ ASTs OptimizeIfChainsVisitor::ifChain(const ASTPtr & child)
         cur.push_back(function_node->arguments->children[0]);
         return cur;
     }
-    else
-    {
-        ASTs end;
-        end.reserve(3);
-        end.push_back(function_node->arguments->children[2]);
-        end.push_back(function_node->arguments->children[1]);
-        end.push_back(function_node->arguments->children[0]);
-        return end;
-    }
+
+    ASTs end;
+    end.reserve(3);
+    end.push_back(function_node->arguments->children[2]);
+    end.push_back(function_node->arguments->children[1]);
+    end.push_back(function_node->arguments->children[0]);
+    return end;
 }
 
 }

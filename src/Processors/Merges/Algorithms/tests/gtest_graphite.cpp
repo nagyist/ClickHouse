@@ -18,17 +18,6 @@
 
 using namespace DB;
 
-static int regAggregateFunctions = 0;
-
-void tryRegisterAggregateFunctions()
-{
-    if (!regAggregateFunctions)
-    {
-        registerAggregateFunctions();
-        regAggregateFunctions = 1;
-    }
-}
-
 static ConfigProcessor::LoadedConfig loadConfiguration(const std::string & config_path)
 {
     ConfigProcessor config_processor(config_path, true, true);
@@ -58,7 +47,7 @@ static ConfigProcessor::LoadedConfig loadConfigurationFromString(std::string & s
         {
             throw std::runtime_error("unable write to temp file");
         }
-        int error = close(fd);
+        [[maybe_unused]] int error = close(fd);
         chassert(!error);
 
         auto config_path = std::string(tmp_file) + ".xml";

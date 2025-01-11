@@ -183,6 +183,16 @@ namespace Net
         /// Returns true iff a reused session was negotiated during
         /// the handshake.
 
+        virtual void setBlocking(bool flag);
+        /// Sets the socket in blocking mode if flag is true,
+        /// disables blocking mode if flag is false.
+
+        virtual bool getBlocking() const;
+        /// Returns the blocking mode of the socket.
+        /// This method will only work if the blocking modes of
+        /// the socket are changed via the setBlocking method!
+
+
     protected:
         void acceptSSL();
         /// Assume per-object mutex is locked.
@@ -225,8 +235,6 @@ namespace Net
         /// Note that simply closing a socket is not sufficient
         /// to be able to re-use it again.
 
-        Poco::Timespan getMaxTimeout();
-
     private:
         SecureSocketImpl(const SecureSocketImpl &);
         SecureSocketImpl & operator=(const SecureSocketImpl &);
@@ -240,6 +248,9 @@ namespace Net
         Session::Ptr _pSession;
 
         friend class SecureStreamSocketImpl;
+
+        Poco::Timespan getMaxTimeoutOrLimit();
+        //// Return max(send, receive) if non zero, otherwise maximum timeout
     };
 
 

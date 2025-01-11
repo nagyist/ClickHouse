@@ -120,6 +120,7 @@
 #define POCO_ARCH_AARCH64 0x0f
 #define POCO_ARCH_ARM64 0x0f // same as POCO_ARCH_AARCH64
 #define POCO_ARCH_RISCV64 0x10
+#define POCO_ARCH_LOONGARCH64 0x12
 
 
 #if defined(__ALPHA) || defined(__alpha) || defined(__alpha__) || defined(_M_ALPHA)
@@ -209,25 +210,9 @@
 #elif defined(__riscv) && (__riscv_xlen == 64)
 #    define POCO_ARCH POCO_ARCH_RISCV64
 #    define POCO_ARCH_LITTLE_ENDIAN 1
-#endif
-
-
-#if defined(__clang__)
-#    define POCO_COMPILER_CLANG
-#elif defined(__GNUC__)
-#    define POCO_COMPILER_GCC
-#elif defined(__MINGW32__) || defined(__MINGW64__)
-#    define POCO_COMPILER_MINGW
-#elif defined(__INTEL_COMPILER) || defined(__ICC) || defined(__ECC) || defined(__ICL)
-#    define POCO_COMPILER_INTEL
-#elif defined(__MWERKS__) || defined(__CWCC__)
-#    define POCO_COMPILER_CODEWARRIOR
-#elif defined(__sgi) || defined(sgi)
-#    define POCO_COMPILER_SGI
-#elif defined(__BORLANDC__) || defined(__CODEGEARC__)
-#    define POCO_COMPILER_CBUILDER
-#elif defined(__DMC__)
-#    define POCO_COMPILER_DMARS
+#elif defined(__loongarch64)
+#    define POCO_ARCH POCO_ARCH_LOONGARCH64
+#    define POCO_ARCH_LITTLE_ENDIAN 1
 #endif
 
 

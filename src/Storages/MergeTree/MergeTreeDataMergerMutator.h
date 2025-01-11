@@ -7,7 +7,7 @@
 #include <Common/ActionBlocker.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MutationCommands.h>
-#include <Storages/MergeTree/TTLMergeSelector.h>
+#include <Storages/MergeTree/MergeSelectors/TTLMergeSelector.h>
 #include <Storages/MergeTree/MergeAlgorithm.h>
 #include <Storages/MergeTree/MergeType.h>
 #include <Storages/MergeTree/MergeTask.h>
@@ -20,14 +20,14 @@ namespace DB
 
 class MergeProgressCallback;
 
-enum class SelectPartsDecision
+enum class SelectPartsDecision : uint8_t
 {
     SELECTED = 0,
     CANNOT_SELECT = 1,
     NOTHING_TO_MERGE = 2,
 };
 
-enum class ExecuteTTLType
+enum class ExecuteTTLType : uint8_t
 {
     NONE = 0,
     NORMAL = 1,
@@ -43,7 +43,7 @@ public:
     using AllowedMergingPredicate = std::function<bool (const MergeTreeData::DataPartPtr &,
                                                         const MergeTreeData::DataPartPtr &,
                                                         const MergeTreeTransaction *,
-                                                        String *)>;
+                                                        PreformattedMessage &)>;
 
     explicit MergeTreeDataMergerMutator(MergeTreeData & data_);
 
@@ -62,6 +62,63 @@ public:
       */
     UInt64 getMaxSourcePartSizeForMutation() const;
 
+    struct PartitionInfo
+    {
+        time_t min_age{std::numeric_limits<time_t>::max()};
+        size_t num_parts = 0;
+        size_t sum_bytes = 0;
+    };
+    using PartitionsInfo = std::unordered_map<std::string, PartitionInfo>;
+
+    using PartitionIdsHint = std::unordered_set<String>;
+
+    /// The first step of selecting parts to merge: returns a list of all active/visible parts
+    MergeTreeData::DataPartsVector getDataPartsToSelectMergeFrom(const MergeTreeTransactionPtr & txn) const;
+
+    /// Same as above, but filters partitions according to partitions_hint
+    MergeTreeData::DataPartsVector getDataPartsToSelectMergeFrom(
+        const MergeTreeTransactionPtr & txn,
+        const PartitionIdsHint * partitions_hint) const;
+
+    struct MergeSelectingInfo
+    {
+        time_t current_time;
+        PartitionsInfo partitions_info;
+        IMergeSelector::PartsRanges parts_ranges;
+        size_t parts_selected_precondition = 0;
+    };
+
+    /// The second step of selecting parts to merge: splits parts list into a set of ranges according to can_merge_callback.
+    /// All parts within a range can be merged without violating some invariants.
+    MergeSelectingInfo getPossibleMergeRanges(
+        const MergeTreeData::DataPartsVector & data_parts,
+        const AllowedMergingPredicate & can_merge_callback,
+        const MergeTreeTransactionPtr & txn,
+        PreformattedMessage & out_disable_reason) const;
+
+    /// The third step of selecting parts to merge: takes ranges that we can merge, and selects parts that we want to merge
+    SelectPartsDecision selectPartsToMergeFromRanges(
+        FutureMergedMutatedPartPtr future_part,
+        bool aggressive,
+        size_t max_total_size_to_merge,
+        bool merge_with_ttl_allowed,
+        const StorageMetadataPtr & metadata_snapshot,
+        const IMergeSelector::PartsRanges & parts_ranges,
+        const time_t & current_time,
+        PreformattedMessage & out_disable_reason,
+        bool dry_run = false);
+
+    /// Actually the most fresh partition with biggest modification_time
+    String getBestPartitionToOptimizeEntire(const PartitionsInfo & partitions_info, size_t max_total_size_to_merge = 0) const;
+
+    /// Useful to quickly get a list of partitions that contain parts that we may want to merge
+    /// The result is limited by top_number_of_partitions_to_consider_for_merge
+    PartitionIdsHint getPartitionsThatMayBeMerged(
+        size_t max_total_size_to_merge,
+        const AllowedMergingPredicate & can_merge_callback,
+        bool merge_with_ttl_allowed,
+        const MergeTreeTransactionPtr & txn) const;
+
     /** Selects which parts to merge. Uses a lot of heuristics.
       *
       * can_merge - a function that determines if it is possible to merge a pair of adjacent parts.
@@ -76,7 +133,8 @@ public:
         const AllowedMergingPredicate & can_merge,
         bool merge_with_ttl_allowed,
         const MergeTreeTransactionPtr & txn,
-        String * out_disable_reason = nullptr);
+        PreformattedMessage & out_disable_reason,
+        const PartitionIdsHint * partitions_hint = nullptr);
 
     /** Select all the parts in the specified partition for merge, if possible.
       * final - choose to merge even a single part - that is, allow to merge one part "with itself",
@@ -90,7 +148,7 @@ public:
         bool final,
         const StorageMetadataPtr & metadata_snapshot,
         const MergeTreeTransactionPtr & txn,
-        String * out_disable_reason = nullptr,
+        PreformattedMessage & out_disable_reason,
         bool optimize_skip_merged_partitions = false);
 
     /** Creates a task to merge parts.
@@ -105,7 +163,7 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         MergeListEntry * merge_entry,
         std::unique_ptr<MergeListElement> projection_merge_list_element,
-        TableLockHolder table_lock_holder,
+        TableLockHolder & table_lock_holder,
         time_t time_of_merge,
         ContextPtr context,
         ReservationSharedPtr space_reservation,
@@ -139,7 +197,7 @@ public:
 
 
     /// The approximate amount of disk space needed for merge or mutation. With a surplus.
-    static size_t estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts);
+    static size_t estimateNeededDiskSpace(const MergeTreeData::DataPartsVector & source_parts, const bool & account_for_deleted = false);
 
 private:
     /** Select all parts belonging to the same partition.
@@ -153,13 +211,13 @@ public :
     /** Is used to cancel all merges and mutations. On cancel() call all currently running actions will throw exception soon.
       * All new attempts to start a merge or mutation will throw an exception until all 'LockHolder' objects will be destroyed.
       */
-    ActionBlocker merges_blocker;
+    PartitionActionBlocker merges_blocker;
     ActionBlocker ttl_merges_blocker;
 
 private:
     MergeTreeData & data;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     /// When the last time you wrote to the log that the disk space was running out (not to write about this too often).
     time_t disk_space_warning_time = 0;

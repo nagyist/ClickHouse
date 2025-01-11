@@ -2,6 +2,7 @@
 
 #include <Access/SettingsProfileElement.h>
 #include <Common/SettingsChanges.h>
+#include <Common/SettingSource.h>
 #include <unordered_map>
 
 namespace Poco::Util
@@ -39,7 +40,7 @@ class AccessControl;
   *               <const/>
   *           </force_index_by_date>
   *           <max_threads>
-  *               <changable_in_readonly/>
+  *               <changeable_in_readonly/>
   *           </max_threads>
   *       </constraints>
   *   </user_profile>
@@ -49,7 +50,7 @@ class AccessControl;
   * If a setting cannot be change due to the read-only mode this class throws an exception.
   * The value of `readonly` is understood as follows:
   * 0 - not read-only mode, no additional checks.
-  * 1 - only read queries, as well as changing settings with <changable_in_readonly/> flag.
+  * 1 - only read queries, as well as changing settings with <changeable_in_readonly/> flag.
   * 2 - only read queries and you can change the settings, except for the `readonly` setting.
   *
   */
@@ -73,17 +74,19 @@ public:
     void merge(const SettingsConstraints & other);
 
     /// Checks whether `change` violates these constraints and throws an exception if so.
-    void check(const Settings & current_settings, const SettingsProfileElements & profile_elements) const;
-    void check(const Settings & current_settings, const SettingChange & change) const;
-    void check(const Settings & current_settings, const SettingsChanges & changes) const;
-    void check(const Settings & current_settings, SettingsChanges & changes) const;
+    void check(const Settings & current_settings, const SettingChange & change, SettingSource source) const;
+    void check(const Settings & current_settings, const SettingsChanges & changes, SettingSource source) const;
+    void check(const Settings & current_settings, SettingsChanges & changes, SettingSource source) const;
+    void check(const Settings & current_settings, const SettingsProfileElements & profile_elements, SettingSource source) const;
+    void check(const Settings & current_settings, const AlterSettingsProfileElements & profile_elements, SettingSource source) const;
 
     /// Checks whether `change` violates these constraints and throws an exception if so. (setting short name is expected inside `changes`)
     void check(const MergeTreeSettings & current_settings, const SettingChange & change) const;
     void check(const MergeTreeSettings & current_settings, const SettingsChanges & changes) const;
 
     /// Checks whether `change` violates these and clamps the `change` if so.
-    void clamp(const Settings & current_settings, SettingsChanges & changes) const;
+    void clamp(const Settings & current_settings, SettingsChanges & changes, SettingSource source) const;
+
 
     friend bool operator ==(const SettingsConstraints & left, const SettingsConstraints & right);
     friend bool operator !=(const SettingsConstraints & left, const SettingsConstraints & right) { return !(left == right); }
@@ -98,8 +101,8 @@ private:
     struct Constraint
     {
         SettingConstraintWritability writability = SettingConstraintWritability::WRITABLE;
-        Field min_value;
-        Field max_value;
+        Field min_value{};
+        Field max_value{};
 
         bool operator ==(const Constraint & other) const;
         bool operator !=(const Constraint & other) const { return !(*this == other); }
@@ -111,7 +114,7 @@ private:
         using NameResolver = std::function<std::string_view(std::string_view)>;
         NameResolver setting_name_resolver;
 
-        String explain;
+        PreformattedMessage explain;
         int code = 0;
 
         // Allows everything
@@ -120,7 +123,7 @@ private:
         {}
 
         // Forbidden with explanation
-        Checker(const String & explain_, int code_)
+        Checker(const PreformattedMessage & explain_, int code_)
             : constraint{.writability = SettingConstraintWritability::CONST}
             , explain(explain_)
             , code(code_)
@@ -133,7 +136,10 @@ private:
         {}
 
         // Perform checking
-        bool check(SettingChange & change, const Field & new_value, ReactionOnViolation reaction) const;
+        bool check(SettingChange & change,
+                   const Field & new_value,
+                   ReactionOnViolation reaction,
+                   SettingSource source) const;
     };
 
     struct StringHash
@@ -145,7 +151,11 @@ private:
         }
     };
 
-    bool checkImpl(const Settings & current_settings, SettingChange & change, ReactionOnViolation reaction) const;
+    bool checkImpl(const Settings & current_settings,
+                  SettingChange & change,
+                  ReactionOnViolation reaction,
+                  SettingSource source) const;
+
     bool checkImpl(const MergeTreeSettings & current_settings, SettingChange & change, ReactionOnViolation reaction) const;
 
     Checker getChecker(const Settings & current_settings, std::string_view setting_name) const;

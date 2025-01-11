@@ -32,7 +32,7 @@ ObjectId::ObjectId(const std::string& id)
 	poco_assert_dbg(id.size() == 24);
 
     const char* p = id.c_str();
-    for (std::size_t i = 0; i < 12; ++i) 
+    for (std::size_t i = 0; i < 12; ++i)
     {
 		_id[i] = fromHex(p);
 		p += 2;
@@ -57,7 +57,7 @@ std::string ObjectId::toString(const std::string& fmt) const
 
 	for (int i = 0; i < 12; ++i)
 	{
-		s += format(fmt, (unsigned int) _id[i]);
+		s += Poco::format(fmt, (unsigned int) _id[i]);
 	}
 	return s;
 }

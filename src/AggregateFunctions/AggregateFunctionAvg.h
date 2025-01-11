@@ -10,7 +10,6 @@
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <AggregateFunctions/AggregateFunctionSum.h>
 #include <Core/DecimalFunctions.h>
-#include <Core/IResolvedFunction.h>
 
 #include "config.h"
 
@@ -109,7 +108,7 @@ public:
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
     {
-        writeBinary(this->data(place).numerator, buf);
+        writeBinaryLittleEndian(this->data(place).numerator, buf);
 
         if constexpr (std::is_unsigned_v<Denominator>)
             writeVarUInt(this->data(place).denominator, buf);
@@ -119,7 +118,7 @@ public:
 
     void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override
     {
-        readBinary(this->data(place).numerator, buf);
+        readBinaryLittleEndian(this->data(place).numerator, buf);
 
         if constexpr (std::is_unsigned_v<Denominator>)
             readVarUInt(this->data(place).denominator, buf);
@@ -141,13 +140,16 @@ public:
 
     bool isCompilable() const override
     {
+        if constexpr (!canBeNativeType<Numerator>() || !canBeNativeType<Denominator>())
+            return false;
+
         bool can_be_compiled = true;
 
         for (const auto & argument : this->argument_types)
             can_be_compiled &= canBeNativeType(*argument);
 
-        auto return_type = this->getResultType();
-        can_be_compiled &= canBeNativeType(*return_type);
+        const auto & result_type = this->getResultType();
+        can_be_compiled &= canBeNativeType(*result_type);
 
         return can_be_compiled;
     }
@@ -158,7 +160,8 @@ public:
         b.CreateMemSet(aggregate_data_ptr, llvm::ConstantInt::get(b.getInt8Ty(), 0), sizeof(Fraction), llvm::assumeAligned(this->alignOfData()));
     }
 
-    void compileMerge(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_dst_ptr, llvm::Value * aggregate_data_src_ptr) const override
+    void compileMergeImpl(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_dst_ptr, llvm::Value * aggregate_data_src_ptr) const
+    requires(canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
@@ -185,7 +188,15 @@ public:
         b.CreateStore(denominator_result_value, denominator_dst_ptr);
     }
 
-    llvm::Value * compileGetResult(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr) const override
+    void
+    compileMerge(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_dst_ptr, llvm::Value * aggregate_data_src_ptr) const override
+    {
+        if constexpr (canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
+            compileMergeImpl(builder, aggregate_data_dst_ptr, aggregate_data_src_ptr);
+    }
+
+    llvm::Value * compileGetResultImpl(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr) const
+    requires(canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
@@ -198,10 +209,17 @@ public:
         auto * denominator_ptr = b.CreateConstGEP1_32(b.getInt8Ty(), aggregate_data_ptr, denominator_offset);
         auto * denominator_value = b.CreateLoad(denominator_type, denominator_ptr);
 
-        auto * double_numerator = nativeCast<Numerator>(b, numerator_value, b.getDoubleTy());
-        auto * double_denominator = nativeCast<Denominator>(b, denominator_value, b.getDoubleTy());
+        auto * double_numerator = nativeCast<Numerator>(b, numerator_value, this->getResultType());
+        auto * double_denominator = nativeCast<Denominator>(b, denominator_value, this->getResultType());
 
         return b.CreateFDiv(double_numerator, double_denominator);
+    }
+
+    llvm::Value * compileGetResult(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr) const override
+    {
+        if constexpr (canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
+            return compileGetResultImpl(builder, aggregate_data_ptr);
+        return nullptr;
     }
 
 #endif
@@ -231,7 +249,7 @@ public:
 
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const final
     {
-        increment(place, static_cast<const ColVecType &>(*columns[0]).getData()[row_num]);
+        increment(place, Numerator(static_cast<const ColVecType &>(*columns[0]).getData()[row_num]));
         ++this->data(place).denominator;
     }
 
@@ -308,7 +326,8 @@ public:
 
 #if USE_EMBEDDED_COMPILER
 
-    void compileAdd(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr, const DataTypes & arguments_types, const std::vector<llvm::Value *> & argument_values) const override
+    void compileAddImpl(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr, const ValuesWithType & arguments) const
+    requires(canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
     {
         llvm::IRBuilder<> & b = static_cast<llvm::IRBuilder<> &>(builder);
 
@@ -316,7 +335,7 @@ public:
 
         auto * numerator_ptr = aggregate_data_ptr;
         auto * numerator_value = b.CreateLoad(numerator_type, numerator_ptr);
-        auto * value_cast_to_numerator = nativeCast(b, arguments_types[0], argument_values[0], numerator_type);
+        auto * value_cast_to_numerator = nativeCast(b, arguments[0], toNativeDataType<Numerator>());
         auto * numerator_result_value = numerator_type->isIntegerTy() ? b.CreateAdd(numerator_value, value_cast_to_numerator) : b.CreateFAdd(numerator_value, value_cast_to_numerator);
         b.CreateStore(numerator_result_value, numerator_ptr);
 
@@ -325,6 +344,12 @@ public:
         auto * denominator_ptr = b.CreateConstGEP1_32(b.getInt8Ty(), aggregate_data_ptr, denominator_offset);
         auto * denominator_value_updated = b.CreateAdd(b.CreateLoad(denominator_type, denominator_ptr), llvm::ConstantInt::get(denominator_type, 1));
         b.CreateStore(denominator_value_updated, denominator_ptr);
+    }
+
+    void compileAdd(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr, const ValuesWithType & arguments) const override
+    {
+        if constexpr (canBeNativeType<Numerator>() && canBeNativeType<Denominator>())
+            compileAddImpl(builder, aggregate_data_ptr, arguments);
     }
 
 #endif

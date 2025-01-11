@@ -2,7 +2,6 @@
 
 #include <base/types.h>
 #include <base/StringRef.h>
-#include <concepts>
 
 
 namespace DB
@@ -23,5 +22,8 @@ String backQuote(StringRef x);
 
 /// Quote the identifier with backquotes, if required.
 String backQuoteIfNeed(StringRef x);
+
+/// Quote the identifier with backquotes, for use in MySQL queries.
+String backQuoteMySQL(StringRef x);
 
 }

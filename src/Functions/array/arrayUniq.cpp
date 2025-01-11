@@ -18,7 +18,7 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
+    extern const int SIZES_OF_ARRAYS_DONT_MATCH;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
@@ -57,6 +57,11 @@ public:
                                 getName(), i + 1, arguments[i]->getName());
         }
 
+        return std::make_shared<DataTypeUInt32>();
+    }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
         return std::make_shared<DataTypeUInt32>();
     }
 
@@ -151,7 +156,7 @@ ColumnPtr FunctionArrayUniq::executeImpl(const ColumnsWithTypeAndName & argument
         if (i == 0)
             offsets = &offsets_i;
         else if (offsets_i != *offsets)
-            throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH, "Lengths of all arrays passed to {} must be equal.",
+            throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH, "Lengths of all arrays passed to {} must be equal.",
                 getName());
 
         const auto * array_data = &array->getData();
@@ -162,7 +167,7 @@ ColumnPtr FunctionArrayUniq::executeImpl(const ColumnsWithTypeAndName & argument
 
     for (size_t i = 0; i < num_arguments; ++i)
     {
-        if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(*data_columns[i]))
+        if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(data_columns[i]))
         {
             if (num_arguments == 1)
                 data_columns[i] = &nullable_col->getNestedColumn();

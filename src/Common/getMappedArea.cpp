@@ -3,8 +3,8 @@
 
 #if defined(OS_LINUX)
 
-#include <Common/StringUtils/StringUtils.h>
-#include <Common/hex.h>
+#include <Common/StringUtils.h>
+#include <base/hex.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 

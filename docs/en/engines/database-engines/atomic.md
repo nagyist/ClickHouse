@@ -6,7 +6,7 @@ sidebar_position: 10
 
 # Atomic 
 
-It supports non-blocking [DROP TABLE](#drop-detach-table) and [RENAME TABLE](#rename-table) queries and atomic [EXCHANGE TABLES](#exchange-tables) queries. `Atomic` database engine is used by default.
+It supports non-blocking [DROP TABLE](#drop-detach-table) and [RENAME TABLE](#rename-table) queries and atomic [EXCHANGE TABLES](#exchange-tables) queries. `Atomic` database engine is used by default. Note that on ClickHouse Cloud, the `Replicated` database engine is used by default.
 
 ## Creating a Database {#creating-a-database}
 
@@ -59,4 +59,4 @@ For [ReplicatedMergeTree](../table-engines/mergetree-family/replication.md#table
 
 ## See Also
 
--   [system.databases](../../operations/system-tables/databases.md) system table
+- [system.databases](../../operations/system-tables/databases.md) system table

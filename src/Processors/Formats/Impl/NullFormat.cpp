@@ -1,12 +1,14 @@
 #include <Processors/Formats/Impl/NullFormat.h>
 #include <Formats/FormatFactory.h>
-#include <IO/WriteBuffer.h>
+#include <IO/NullWriteBuffer.h>
 
 
 namespace DB
 {
 
-WriteBuffer NullOutputFormat::empty_buffer(nullptr, 0);
+NullWriteBuffer NullOutputFormat::empty_buffer;
+
+NullOutputFormat::NullOutputFormat(const Block & header) : IOutputFormat(header, empty_buffer) {}
 
 void registerOutputFormatNull(FormatFactory & factory)
 {

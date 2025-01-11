@@ -1,6 +1,7 @@
 ---
 slug: /en/sql-reference/table-functions/hudi
-sidebar_label: Hudi
+sidebar_position: 85
+sidebar_label: hudi
 ---
 
 # hudi Table Function
@@ -28,4 +29,4 @@ A table with the specified structure for reading data in the specified Hudi tabl
 **See Also**
 
 - [Hudi engine](/docs/en/engines/table-engines/integrations/hudi.md)
-
+- [Hudi cluster table function](/docs/en/sql-reference/table-functions/hudiCluster.md)

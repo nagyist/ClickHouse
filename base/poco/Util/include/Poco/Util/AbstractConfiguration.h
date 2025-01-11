@@ -167,7 +167,6 @@ namespace Util
         /// If the value contains references to other properties (${<property>}), these
         /// are expanded.
 
-#if defined(POCO_HAVE_INT64)
 
         Int64 getInt64(const std::string & key) const;
         /// Returns the Int64 value of the property with the given name.
@@ -205,7 +204,6 @@ namespace Util
         /// If the value contains references to other properties (${<property>}), these
         /// are expanded.
 
-#endif // defined(POCO_HAVE_INT64)
 
         double getDouble(const std::string & key) const;
         /// Returns the double value of the property with the given name.
@@ -243,6 +241,20 @@ namespace Util
         /// If the value contains references to other properties (${<property>}), these
         /// are expanded.
 
+        std::string getHost(const std::string & key) const;
+        /// Returns the string value of the host property with the given name.
+        /// Throws a NotFoundException if the key does not exist.
+        /// Throws a SyntaxException if the property is not a valid host (IP address or domain).
+        /// If the value contains references to other properties (${<property>}), these
+        /// are expanded.
+
+        std::string getHost(const std::string & key, const std::string & defaultValue) const;
+        /// If a property with the given key exists, returns the host property's string value,
+        /// otherwise returns the given default value.
+        /// Throws a SyntaxException if the property is not a valid host (IP address or domain).
+        /// If the value contains references to other properties (${<property>}), these
+        /// are expanded.
+
         virtual void setString(const std::string & key, const std::string & value);
         /// Sets the property with the given key to the given value.
         /// An already existing value for the key is overwritten.
@@ -255,7 +267,6 @@ namespace Util
         /// Sets the property with the given key to the given value.
         /// An already existing value for the key is overwritten.
 
-#if defined(POCO_HAVE_INT64)
 
         virtual void setInt64(const std::string & key, Int64 value);
         /// Sets the property with the given key to the given value.
@@ -265,7 +276,6 @@ namespace Util
         /// Sets the property with the given key to the given value.
         /// An already existing value for the key is overwritten.
 
-#endif // defined(POCO_HAVE_INT64)
 
         virtual void setDouble(const std::string & key, double value);
         /// Sets the property with the given key to the given value.
@@ -335,21 +345,42 @@ namespace Util
         static int parseInt(const std::string & value);
         static unsigned parseUInt(const std::string & value);
 
-#if defined(POCO_HAVE_INT64)
 
         static Int64 parseInt64(const std::string & value);
         static UInt64 parseUInt64(const std::string & value);
 
-#endif // defined(POCO_HAVE_INT64)
 
         static bool parseBool(const std::string & value);
         void setRawWithEvent(const std::string & key, std::string value);
+
+        static void checkHostValidity(const std::string & value);
+        /// Throws a SyntaxException if the value is not a valid host (IP address or domain).
 
         virtual ~AbstractConfiguration();
 
     private:
         std::string internalExpand(const std::string & value) const;
         std::string uncheckedExpand(const std::string & value) const;
+
+        static bool isValidIPv4Address(const std::string & value);
+        /// IPv4 address considered valid if it is "0.0.0.0" or one of those,
+        /// defined by inet_aton() or inet_addr()
+
+        static bool isValidIPv6Address(const std::string & value);
+        /// IPv6 address considered valid if it is "::" or one of those,
+        /// defined by inet_pton() with AF_INET6 flag
+        /// (in this case it may have scope id and may be surrounded by '[', ']')
+
+        static bool isValidDomainName(const std::string & value);
+        /// <domain> ::= <subdomain> [ "." ]
+        /// <subdomain> ::= <label> | <subdomain> "." <label>
+        /// <label> ::= <letter> [ [ <ldh-str> ] <let-dig> ]
+        /// <ldh-str> ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+        /// <let-dig-hyp> ::= <let-dig> | "-"
+        /// <let-dig> ::= <letter> | <digit>
+        /// <letter> ::= any one of the 52 alphabetic characters A through Z in
+        /// upper case and a through z in lower case
+        /// <digit> ::= any one of the ten digits 0 through 9
 
         AbstractConfiguration(const AbstractConfiguration &);
         AbstractConfiguration & operator=(const AbstractConfiguration &);

@@ -1,10 +1,14 @@
 # pylint: disable=unused-argument
 # pylint: disable=redefined-outer-name
 
+import fnmatch
+
 import pytest
 
-from helpers.cluster import ClickHouseCluster
 from helpers.client import QueryRuntimeException
+from helpers.cluster import ClickHouseCluster
+
+MB = 1024 * 1024
 
 cluster = ClickHouseCluster(__file__)
 
@@ -26,18 +30,37 @@ def start_cluster():
 
 def test_cache_evicted_by_temporary_data(start_cluster):
     q = node.query
-    qi = lambda query: int(node.query(query).strip())
-
-    cache_size_initial = qi("SELECT sum(size) FROM system.filesystem_cache")
-    assert cache_size_initial == 0
-
-    free_space_initial = qi(
-        "SELECT free_space FROM system.disks WHERE name = 'tiny_local_cache_local_disk'"
+    get_free_space = lambda: int(
+        q(
+            "SELECT free_space FROM system.disks WHERE name = 'tiny_local_cache_local_disk'"
+        ).strip()
     )
-    assert free_space_initial > 8 * 1024 * 1024
+    get_cache_size = lambda: int(
+        q("SELECT sum(size) FROM system.filesystem_cache").strip()
+    )
 
+    dump_debug_info = lambda: "\n".join(
+        [
+            ">>> filesystem_cache <<<",
+            q("SELECT * FROM system.filesystem_cache FORMAT Vertical"),
+            ">>> remote_data_paths <<<",
+            q("SELECT * FROM system.remote_data_paths FORMAT Vertical"),
+            ">>> tiny_local_cache_local_disk <<<",
+            q(
+                "SELECT * FROM system.disks WHERE name = 'tiny_local_cache_local_disk' FORMAT Vertical"
+            ),
+        ]
+    )
+
+    q("SYSTEM DROP FILESYSTEM CACHE")
+    q("DROP TABLE IF EXISTS t1 SYNC")
+
+    assert get_cache_size() == 0, dump_debug_info()
+    assert get_free_space() > 8 * MB, dump_debug_info()
+
+    # Codec is NONE to make cache size predictable
     q(
-        "CREATE TABLE t1 (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 'tiny_local_cache'"
+        "CREATE TABLE t1 (x UInt64 CODEC(NONE)) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 'tiny_local_cache'"
     )
     q("INSERT INTO t1 SELECT number FROM numbers(1024 * 1024)")
 
@@ -48,34 +71,61 @@ def test_cache_evicted_by_temporary_data(start_cluster):
     # Read some data to fill the cache
     q("SELECT sum(x) FROM t1")
 
-    cache_size_with_t1 = qi("SELECT sum(size) FROM system.filesystem_cache")
-    assert cache_size_with_t1 > 8 * 1024 * 1024
+    cache_size_with_t1 = get_cache_size()
+    assert cache_size_with_t1 > 8 * MB, dump_debug_info()
 
     # Almost all disk space is occupied by t1 cache
-    free_space_with_t1 = qi(
-        "SELECT free_space FROM system.disks WHERE name = 'tiny_local_cache_local_disk'"
-    )
-    assert free_space_with_t1 < 4 * 1024 * 1024
+    free_space_with_t1 = get_free_space()
+    assert free_space_with_t1 < 4 * MB, dump_debug_info()
 
     # Try to sort the table, but fail because of lack of disk space
     with pytest.raises(QueryRuntimeException) as exc:
         q(
             "SELECT ignore(*) FROM numbers(10 * 1024 * 1024) ORDER BY sipHash64(number)",
             settings={
+                "max_bytes_ratio_before_external_group_by": 0,
+                "max_bytes_ratio_before_external_sort": 0,
                 "max_bytes_before_external_group_by": "4M",
                 "max_bytes_before_external_sort": "4M",
+                "temporary_files_codec": "ZSTD",
             },
         )
-    assert "Failed to reserve space for the file cache" in str(exc.value)
+    assert fnmatch.fnmatch(
+        str(exc.value), "*Failed to reserve * for temporary file*"
+    ), exc.value
 
     # Some data evicted from cache by temporary data
-    cache_size_after_eviction = qi("SELECT sum(size) FROM system.filesystem_cache")
-    assert cache_size_after_eviction < cache_size_with_t1
+    cache_size_after_eviction = get_cache_size()
+    assert cache_size_after_eviction < cache_size_with_t1, dump_debug_info()
 
     # Disk space freed, at least 3 MB, because temporary data tried to write 4 MB
-    free_space_after_eviction = qi(
-        "SELECT free_space FROM system.disks WHERE name = 'tiny_local_cache_local_disk'"
-    )
-    assert free_space_after_eviction > free_space_with_t1 + 3 * 1024 * 1024
+    assert get_free_space() > free_space_with_t1 + 3 * MB, dump_debug_info()
 
-    q("DROP TABLE IF EXISTS t1")
+    # Read some data to fill the cache again
+    q("SELECT avg(x) FROM t1")
+
+    cache_size_with_t1 = get_cache_size()
+    assert cache_size_with_t1 > 8 * MB, dump_debug_info()
+
+    # Almost all disk space is occupied by t1 cache
+    free_space_with_t1 = get_free_space()
+    assert free_space_with_t1 < 4 * MB, dump_debug_info()
+
+    node.http_query(
+        "SELECT randomPrintableASCII(1024) FROM numbers(8 * 1024) FORMAT TSV",
+        params={"buffer_size": 0, "wait_end_of_query": 1},
+    )
+
+    assert get_free_space() > free_space_with_t1 + 3 * MB, dump_debug_info()
+
+    # not enough space for buffering 32 MB
+    with pytest.raises(Exception) as exc:
+        node.http_query(
+            "SELECT randomPrintableASCII(1024) FROM numbers(32 * 1024) FORMAT TSV",
+            params={"buffer_size": 0, "wait_end_of_query": 1},
+        )
+    assert fnmatch.fnmatch(
+        str(exc.value), "*Failed to reserve * for temporary file*"
+    ), exc.value
+
+    q("DROP TABLE IF EXISTS t1 SYNC")

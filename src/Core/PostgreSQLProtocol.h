@@ -7,7 +7,6 @@
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Session.h>
 #include <Common/logger_useful.h>
-#include <Poco/Format.h>
 #include <Poco/RegularExpression.h>
 #include <Poco/Net/StreamSocket.h>
 #include "Types.h"
@@ -805,20 +804,9 @@ protected:
         const String & user_name,
         const String & password,
         Session & session,
-        Messaging::MessageTransport & mt,
         const Poco::Net::SocketAddress & address)
     {
-        try
-        {
-            session.authenticate(user_name, password, address);
-        }
-        catch (const Exception &)
-        {
-            mt.send(
-                Messaging::ErrorOrNoticeResponse(Messaging::ErrorOrNoticeResponse::ERROR, "28P01", "Invalid user or password"),
-                true);
-            throw;
-        }
+        session.authenticate(user_name, password, address);
     }
 
 public:
@@ -839,10 +827,10 @@ public:
     void authenticate(
         const String & user_name,
         Session & session,
-        Messaging::MessageTransport & mt,
+        [[maybe_unused]] Messaging::MessageTransport & mt,
         const Poco::Net::SocketAddress & address) override
     {
-        return setPassword(user_name, "", session, mt, address);
+        setPassword(user_name, "", session, address);
     }
 
     AuthenticationType getType() const override
@@ -866,7 +854,7 @@ public:
         if (type == Messaging::FrontMessageType::PASSWORD_MESSAGE)
         {
             std::unique_ptr<Messaging::PasswordMessage> password = mt.receive<Messaging::PasswordMessage>();
-            return setPassword(user_name, password->password, session, mt, address);
+            setPassword(user_name, password->password, session, address);
         }
         else
             throw Exception(ErrorCodes::UNEXPECTED_PACKET_FROM_CLIENT,
@@ -883,7 +871,7 @@ public:
 class AuthenticationManager
 {
 private:
-    Poco::Logger * log = &Poco::Logger::get("AuthenticationManager");
+    LoggerPtr log = getLogger("AuthenticationManager");
     std::unordered_map<AuthenticationType, std::shared_ptr<AuthenticationMethod>> type_to_method = {};
 
 public:
@@ -901,20 +889,33 @@ public:
         Messaging::MessageTransport & mt,
         const Poco::Net::SocketAddress & address)
     {
-        const AuthenticationType user_auth_type = session.getAuthenticationTypeOrLogInFailure(user_name);
-        if (type_to_method.find(user_auth_type) != type_to_method.end())
+        try
         {
-            type_to_method[user_auth_type]->authenticate(user_name, session, mt, address);
-            mt.send(Messaging::AuthenticationOk(), true);
-            LOG_DEBUG(log, "Authentication for user {} was successful.", user_name);
-            return;
+            const auto user_authentication_types = session.getAuthenticationTypesOrLogInFailure(user_name);
+
+            for (auto user_authentication_type : user_authentication_types)
+            {
+                if (type_to_method.find(user_authentication_type) != type_to_method.end())
+                {
+                    type_to_method[user_authentication_type]->authenticate(user_name, session, mt, address);
+                    mt.send(Messaging::AuthenticationOk(), true);
+                    LOG_DEBUG(log, "Authentication for user {} was successful.", user_name);
+                    return;
+                }
+            }
+        }
+        catch (const Exception&)
+        {
+            mt.send(Messaging::ErrorOrNoticeResponse(Messaging::ErrorOrNoticeResponse::ERROR, "28P01", "Invalid user or password"),
+                    true);
+
+            throw;
         }
 
-        mt.send(
-            Messaging::ErrorOrNoticeResponse(Messaging::ErrorOrNoticeResponse::ERROR, "0A000", "Authentication method is not supported"),
-            true);
+        mt.send(Messaging::ErrorOrNoticeResponse(Messaging::ErrorOrNoticeResponse::ERROR, "0A000", "Authentication method is not supported"),
+                true);
 
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Authentication type {} is not supported.", user_auth_type);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "None of the authentication methods registered for the user are supported");
     }
 };
 }

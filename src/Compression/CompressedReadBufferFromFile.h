@@ -1,10 +1,9 @@
 #pragma once
 
+#include <memory>
+#include <time.h>
 #include <Compression/CompressedReadBufferBase.h>
 #include <IO/ReadBufferFromFileBase.h>
-#include <IO/ReadSettings.h>
-#include <time.h>
-#include <memory>
 
 
 namespace DB
@@ -43,7 +42,7 @@ private:
 
     bool nextImpl() override;
 
-    void prefetch(int64_t priority) override;
+    void prefetch(Priority priority) override;
 
 public:
     explicit CompressedReadBufferFromFile(std::unique_ptr<ReadBufferFromFileBase> buf, bool allow_different_codecs_ = false);

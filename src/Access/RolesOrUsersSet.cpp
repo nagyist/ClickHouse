@@ -80,15 +80,13 @@ void RolesOrUsersSet::init(const ASTRolesOrUsersSet & ast, const AccessControl *
                 return *id;
             return access_control->getID<Role>(name);
         }
-        else if (ast.allow_users)
+        if (ast.allow_users)
         {
             return access_control->getID<User>(name);
         }
-        else
-        {
-            assert(ast.allow_roles);
-            return access_control->getID<Role>(name);
-        }
+
+        assert(ast.allow_roles);
+        return access_control->getID<Role>(name);
     };
 
     if (!ast.names.empty() && !all)
@@ -228,25 +226,25 @@ void RolesOrUsersSet::add(const std::vector<UUID> & ids_)
 
 bool RolesOrUsersSet::match(const UUID & id) const
 {
-    return (all || ids.count(id)) && !except_ids.count(id);
+    return (all || ids.contains(id)) && !except_ids.contains(id);
 }
 
 
 bool RolesOrUsersSet::match(const UUID & user_id, const boost::container::flat_set<UUID> & enabled_roles) const
 {
-    if (!all && !ids.count(user_id))
+    if (!all && !ids.contains(user_id))
     {
         bool found_enabled_role = std::any_of(
-            enabled_roles.begin(), enabled_roles.end(), [this](const UUID & enabled_role) { return ids.count(enabled_role); });
+            enabled_roles.begin(), enabled_roles.end(), [this](const UUID & enabled_role) { return ids.contains(enabled_role); });
         if (!found_enabled_role)
             return false;
     }
 
-    if (except_ids.count(user_id))
+    if (except_ids.contains(user_id))
         return false;
 
     bool in_except_list = std::any_of(
-        enabled_roles.begin(), enabled_roles.end(), [this](const UUID & enabled_role) { return except_ids.count(enabled_role); });
+        enabled_roles.begin(), enabled_roles.end(), [this](const UUID & enabled_role) { return except_ids.contains(enabled_role); });
     return !in_except_list;
 }
 
@@ -295,6 +293,23 @@ std::vector<UUID> RolesOrUsersSet::findDependencies() const
     return res;
 }
 
+bool RolesOrUsersSet::hasDependencies(const std::unordered_set<UUID> & dependencies_ids) const
+{
+    for (const auto & id : ids)
+    {
+        if (dependencies_ids.contains(id))
+            return true;
+    }
+
+    for (const auto & id : except_ids)
+    {
+        if (dependencies_ids.contains(id))
+            return true;
+    }
+
+    return false;
+}
+
 void RolesOrUsersSet::replaceDependencies(const std::unordered_map<UUID, UUID> & old_to_new_ids)
 {
     std::vector<UUID> new_ids;
@@ -335,6 +350,43 @@ void RolesOrUsersSet::replaceDependencies(const std::unordered_map<UUID, UUID> &
     }
 
     boost::range::copy(new_ids, std::inserter(except_ids, except_ids.end()));
+}
+
+void RolesOrUsersSet::copyDependenciesFrom(const RolesOrUsersSet & src, const std::unordered_set<UUID> & dependencies_ids)
+{
+    if (all != src.all)
+        return;
+
+    for (const auto & id : src.ids)
+    {
+        if (dependencies_ids.contains(id))
+            ids.emplace(id);
+    }
+
+    for (const auto & id : src.except_ids)
+    {
+        if (dependencies_ids.contains(id))
+            except_ids.emplace(id);
+    }
+}
+
+void RolesOrUsersSet::removeDependencies(const std::unordered_set<UUID> & dependencies_ids)
+{
+    for (auto it = ids.begin(); it != ids.end();)
+    {
+        if (dependencies_ids.contains(*it))
+            it = ids.erase(it);
+        else
+            ++it;
+    }
+
+    for (auto it = except_ids.begin(); it != except_ids.end();)
+    {
+        if (dependencies_ids.contains(*it))
+            except_ids.erase(it);
+        else
+            ++it;
+    }
 }
 
 }

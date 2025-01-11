@@ -5,7 +5,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-$CLICKHOUSE_CLIENT -q "
+# NOTE: dictionaries will be updated according to server TZ, not session, so prohibit it's randomization
+$CLICKHOUSE_CLIENT --session_timezone '' -q "
     CREATE TABLE table_for_update_field_dictionary
     (
         key UInt64,
@@ -34,7 +35,7 @@ for layout in "${layouts[@]}"; do
             echo "$layout"
         fi
 
-        $CLICKHOUSE_CLIENT -nm -q "
+        $CLICKHOUSE_CLIENT "
             TRUNCATE TABLE table_for_update_field_dictionary;
 
             CREATE DICTIONARY $dictionary_name
@@ -48,24 +49,31 @@ for layout in "${layouts[@]}"; do
             LAYOUT($layout())
             LIFETIME(1);
 
-            -- { echoOn }
-            INSERT INTO table_for_update_field_dictionary VALUES (1, 'First', now());
-            SELECT key, value FROM $dictionary_name ORDER BY key ASC;
+            INSERT INTO table_for_update_field_dictionary VALUES (1, 'First', now());"
 
-            INSERT INTO table_for_update_field_dictionary VALUES (2, 'Second', now());
-            SELECT sleepEachRow(1) FROM numbers(10) FORMAT Null;
+        while true
+        do
+            $CLICKHOUSE_CLIENT --query "SELECT key, value FROM $dictionary_name ORDER BY key ASC" | grep -A10 -B10 'First' && break;
+            sleep .1;
+        done
 
-            SELECT key, value FROM $dictionary_name ORDER BY key ASC;
+        $CLICKHOUSE_CLIENT --query "INSERT INTO table_for_update_field_dictionary VALUES (2, 'Second', now());"
 
-            INSERT INTO table_for_update_field_dictionary VALUES (2, 'SecondUpdated', now());
-            INSERT INTO table_for_update_field_dictionary VALUES (3, 'Third', now());
-            SELECT sleepEachRow(1) FROM numbers(10) FORMAT Null;
+        while true
+        do
+            $CLICKHOUSE_CLIENT --query "SELECT key, value FROM $dictionary_name ORDER BY key ASC" | grep -A10 -B10 'Second' && break;
+            sleep .1;
+        done
 
-            SELECT key, value FROM $dictionary_name ORDER BY key ASC;
-            -- { echoOff }
+        $CLICKHOUSE_CLIENT --query "INSERT INTO table_for_update_field_dictionary VALUES (2, 'SecondUpdated', now()), (3, 'Third', now())"
 
-            DROP DICTIONARY $dictionary_name;
-        "
+        while true
+        do
+            $CLICKHOUSE_CLIENT --query "SELECT key, value FROM $dictionary_name ORDER BY key ASC" | grep -A10 -B10 'SecondUpdated' && break;
+            sleep .1;
+        done
+
+        $CLICKHOUSE_CLIENT --query "DROP DICTIONARY $dictionary_name"
 
     done
 done

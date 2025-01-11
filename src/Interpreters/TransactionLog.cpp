@@ -1,16 +1,17 @@
-#include <Interpreters/TransactionLog.h>
-#include <Interpreters/TransactionVersionMetadata.h>
-#include <Interpreters/Context.h>
-#include <Interpreters/TransactionsInfoLog.h>
+#include <Core/ServerUUID.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-#include <IO/ReadBufferFromString.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/TransactionLog.h>
+#include <Interpreters/TransactionVersionMetadata.h>
+#include <Interpreters/TransactionsInfoLog.h>
+#include <base/sort.h>
 #include <Common/Exception.h>
 #include <Common/ZooKeeper/KeeperException.h>
-#include <Core/ServerUUID.h>
 #include <Common/logger_useful.h>
 #include <Common/noexcept_scope.h>
-
+#include <Common/threadPoolCallbackRunner.h>
 
 namespace DB
 {
@@ -21,7 +22,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_STATUS_OF_TRANSACTION;
 }
 
-static void tryWriteEventToSystemLog(Poco::Logger * log, ContextPtr context,
+static void tryWriteEventToSystemLog(LoggerPtr log, ContextPtr context,
                                      TransactionsInfoLogElement::Type type, const TransactionID & tid, CSN csn = Tx::UnknownCSN)
 try
 {
@@ -34,7 +35,7 @@ try
     elem.tid = tid;
     elem.csn = csn;
     elem.fillCommonFields(nullptr);
-    system_log->add(elem);
+    system_log->add(std::move(elem));
 }
 catch (...)
 {
@@ -44,7 +45,7 @@ catch (...)
 
 TransactionLog::TransactionLog()
     : global_context(Context::getGlobalContextInstance())
-    , log(&Poco::Logger::get("TransactionLog"))
+    , log(getLogger("TransactionLog"))
     , zookeeper_path(global_context->getConfigRef().getString("transaction_log.zookeeper_path", "/clickhouse/txn"))
     , zookeeper_path_log(zookeeper_path + "/log")
     , fault_probability_before_commit(global_context->getConfigRef().getDouble("transaction_log.fault_probability_before_commit", 0))
@@ -282,7 +283,7 @@ void TransactionLog::removeOldEntries()
     CSN new_tail_ptr = getOldestSnapshot();
     if (new_tail_ptr < old_tail_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Got unexpected tail_ptr {}, oldest snapshot is {}, it's a bug", old_tail_ptr, new_tail_ptr);
-    else if (new_tail_ptr == old_tail_ptr)
+    if (new_tail_ptr == old_tail_ptr)
         return;
 
     /// (it's not supposed to fail with ZBADVERSION while there is only one host)
@@ -350,7 +351,7 @@ void TransactionLog::tryFinalizeUnknownStateTransactions()
         /// CSNs must be already loaded, only need to check if the corresponding mapping exists.
         if (auto csn = getCSN(txn->tid))
         {
-            finalizeCommittedTransaction(txn, csn, state_guard);
+            finalizeCommittedTransaction(txn.get(), csn, state_guard);
         }
         else
         {
@@ -405,22 +406,15 @@ CSN TransactionLog::commitTransaction(const MergeTreeTransactionPtr & txn, bool 
         String csn_path_created;
         try
         {
-            if (unlikely(fault_probability_before_commit > 0.0))
-            {
-                std::bernoulli_distribution fault(fault_probability_before_commit);
-                if (fault(thread_local_rng))
-                    throw Coordination::Exception("Fault injected (before commit)", Coordination::Error::ZCONNECTIONLOSS);
-            }
+            Coordination::SimpleFaultInjection fault(fault_probability_before_commit, fault_probability_after_commit, "commit");
+
+            Coordination::Requests requests;
+            requests.push_back(zkutil::makeCreateRequest(zookeeper_path_log + "/csn-", serializeTID(txn->tid), zkutil::CreateMode::PersistentSequential));
 
             /// Commit point
-            csn_path_created = current_zookeeper->create(zookeeper_path_log + "/csn-", serializeTID(txn->tid), zkutil::CreateMode::PersistentSequential);
+            auto res = current_zookeeper->multi(requests, /* check_session_valid */ true);
 
-            if (unlikely(fault_probability_after_commit > 0.0))
-            {
-                std::bernoulli_distribution fault(fault_probability_after_commit);
-                if (fault(thread_local_rng))
-                    throw Coordination::Exception("Fault injected (after commit)", Coordination::Error::ZCONNECTIONLOSS);
-            }
+            csn_path_created = dynamic_cast<const Coordination::CreateResponse *>(res.back().get())->path_created;
         }
         catch (const Coordination::Exception & e)
         {
@@ -431,7 +425,7 @@ CSN TransactionLog::commitTransaction(const MergeTreeTransactionPtr & txn, bool 
             /// The only thing we can do is to postpone its finalization.
             {
                 std::lock_guard lock{running_list_mutex};
-                unknown_state_list.emplace_back(txn.get(), std::move(state_guard));
+                unknown_state_list.emplace_back(txn, std::move(state_guard));
             }
             log_updated_event->set();
             if (throw_on_unknown_status)
@@ -458,6 +452,7 @@ CSN TransactionLog::commitTransaction(const MergeTreeTransactionPtr & txn, bool 
 CSN TransactionLog::finalizeCommittedTransaction(MergeTreeTransaction * txn, CSN allocated_csn, scope_guard & state_guard) noexcept
 {
     LockMemoryExceptionInThread memory_tracker_lock(VariableContext::Global);
+    auto blocker = CannotAllocateThreadFaultInjector::blockFaultInjections();
     chassert(!allocated_csn == txn->isReadOnly());
     if (allocated_csn)
     {
@@ -482,11 +477,12 @@ CSN TransactionLog::finalizeCommittedTransaction(MergeTreeTransaction * txn, CSN
         bool removed = running_list.erase(txn->tid.getHash());
         if (!removed)
         {
-            LOG_ERROR(log , "I's a bug: TID {} {} doesn't exist", txn->tid.getHash(), txn->tid);
+            LOG_ERROR(log, "It's a bug: TID {} {} doesn't exist", txn->tid.getHash(), txn->tid);
             abort();
         }
     }
 
+    txn->afterFinalize();
     return allocated_csn;
 }
 
@@ -523,6 +519,7 @@ void TransactionLog::rollbackTransaction(const MergeTreeTransactionPtr & txn) no
     }
 
     tryWriteEventToSystemLog(log, global_context, TransactionsInfoLogElement::ROLLBACK, txn->tid);
+    txn->afterFinalize();
 }
 
 MergeTreeTransactionPtr TransactionLog::tryGetRunningTransaction(const TIDHash & tid)
@@ -606,7 +603,7 @@ void TransactionLog::assertTIDIsNotOutdated(const TransactionID & tid, const std
     /// If the second case takes place transaction's commit csn has to be set.
     /// We should load CSN again to distinguish the second case.
     if (failback_with_strict_load_csn)
-        if (CSN maybe_csn = failback_with_strict_load_csn->load())
+        if (CSN _ = failback_with_strict_load_csn->load())
             return;
 
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to get CSN for too old TID {}, current tail_ptr is {}, probably it's a bug", tid, tail);

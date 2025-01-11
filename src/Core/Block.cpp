@@ -1,19 +1,18 @@
-#include <Common/Exception.h>
-#include <Common/FieldVisitorToString.h>
-
-#include <Core/Block.h>
-
-#include <IO/WriteBufferFromString.h>
-#include <IO/Operators.h>
-
-#include <Common/assert_cast.h>
-
+#include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSparse.h>
+#include <Core/Block.h>
+#include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
+#include <base/sort.h>
+#include <Common/Exception.h>
+#include <Common/FieldVisitorToString.h>
+#include <Common/assert_cast.h>
+#include <DataTypes/NestedUtils.h>
 
 #include <iterator>
-#include <base/sort.h>
+
 #include <boost/algorithm/string.hpp>
 
 
@@ -307,6 +306,32 @@ const ColumnWithTypeAndName * Block::findByName(const std::string & name, bool c
     return &data[it->second];
 }
 
+std::optional<ColumnWithTypeAndName> Block::findSubcolumnByName(const std::string & name) const
+{
+    auto [name_in_storage, subcolumn_name] = Nested::splitName(name);
+    if (subcolumn_name.empty())
+        return std::nullopt;
+
+    const auto * column = findByName(name_in_storage, false);
+    if (!column)
+        return std::nullopt;
+
+    auto subcolumn_type = column->type->tryGetSubcolumnType(subcolumn_name);
+    auto subcolumn = column->type->tryGetSubcolumn(subcolumn_name, column->column);
+    if (!subcolumn_type || !subcolumn)
+        return std::nullopt;
+
+    return ColumnWithTypeAndName(subcolumn, subcolumn_type, name);
+}
+
+std::optional<ColumnWithTypeAndName> Block::findColumnOrSubcolumnByName(const std::string & name) const
+{
+    if (const auto * column = findByName(name, false))
+        return *column;
+
+    return findSubcolumnByName(name);
+}
+
 
 const ColumnWithTypeAndName & Block::getByName(const std::string & name, bool case_insensitive) const
 {
@@ -314,6 +339,32 @@ const ColumnWithTypeAndName & Block::getByName(const std::string & name, bool ca
     if (!result)
         throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "Not found column {} in block. There are only columns: {}",
             name, dumpNames());
+
+    return *result;
+}
+
+ColumnWithTypeAndName Block::getSubcolumnByName(const std::string & name) const
+{
+    auto result = findSubcolumnByName(name);
+    if (!result)
+        throw Exception(
+            ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK,
+            "Not found subcolumn {} in block. There are only columns: {}",
+            name,
+            dumpNames());
+
+    return *result;
+}
+
+ColumnWithTypeAndName Block::getColumnOrSubcolumnByName(const std::string & name) const
+{
+    auto result = findColumnOrSubcolumnByName(name);
+    if (!result)
+        throw Exception(
+            ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK,
+            "Not found column or subcolumn {} in block. There are only columns: {}",
+            name,
+            dumpNames());
 
     return *result;
 }
@@ -451,6 +502,14 @@ MutableColumns Block::cloneEmptyColumns() const
     return columns;
 }
 
+MutableColumns Block::cloneEmptyColumns(const Serializations & serializations) const
+{
+    size_t num_columns = data.size();
+    MutableColumns columns(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        columns[i] = data[i].type->createColumn(*serializations[i]);
+    return columns;
+}
 
 Columns Block::getColumns() const
 {
@@ -597,6 +656,32 @@ Block Block::sortColumns() const
     return sorted_block;
 }
 
+Block Block::shrinkToFit() const
+{
+    Columns new_columns(data.size(), nullptr);
+    for (size_t i = 0; i < data.size(); ++i)
+        new_columns[i] = data[i].column->cloneResized(data[i].column->size());
+    return cloneWithColumns(new_columns);
+}
+
+Block Block::compress() const
+{
+    size_t num_columns = data.size();
+    Columns new_columns(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        new_columns[i] = data[i].column->compress(/*force_compression=*/false);
+    return cloneWithColumns(new_columns);
+}
+
+Block Block::decompress() const
+{
+    size_t num_columns = data.size();
+    Columns new_columns(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        new_columns[i] = data[i].column->decompress();
+    return cloneWithColumns(new_columns);
+}
+
 
 const ColumnsWithTypeAndName & Block::getColumnsWithTypeAndName() const
 {
@@ -663,12 +748,10 @@ Names Block::getDataTypeNames() const
 
 Block::NameMap Block::getNamesToIndexesMap() const
 {
-    NameMap res;
-    res.reserve(index_by_name.size());
-
+    NameMap res(index_by_name.size());
+    res.set_empty_key(StringRef{});
     for (const auto & [name, index] : index_by_name)
         res[name] = index;
-
     return res;
 }
 
@@ -747,18 +830,22 @@ void getBlocksDifference(const Block & lhs, const Block & rhs, std::string & out
     while (r > 0)
         right_columns.push_back(rhs.safeGetByPosition(--r));
 
-    WriteBufferFromString lhs_diff_writer(out_lhs_diff);
-    WriteBufferFromString rhs_diff_writer(out_rhs_diff);
-
-    for (auto it = left_columns.rbegin(); it != left_columns.rend(); ++it)
     {
-        lhs_diff_writer << it->dumpStructure();
-        lhs_diff_writer << ", position: " << lhs.getPositionByName(it->name) << '\n';
+        WriteBufferFromString lhs_diff_writer(out_lhs_diff);
+        for (auto it = left_columns.rbegin(); it != left_columns.rend(); ++it)
+        {
+            lhs_diff_writer << it->dumpStructure();
+            lhs_diff_writer << ", position: " << lhs.getPositionByName(it->name) << '\n';
+        }
     }
-    for (auto it = right_columns.rbegin(); it != right_columns.rend(); ++it)
+
     {
-        rhs_diff_writer << it->dumpStructure();
-        rhs_diff_writer << ", position: " << rhs.getPositionByName(it->name) << '\n';
+        WriteBufferFromString rhs_diff_writer(out_rhs_diff);
+        for (auto it = right_columns.rbegin(); it != right_columns.rend(); ++it)
+        {
+            rhs_diff_writer << it->dumpStructure();
+            rhs_diff_writer << ", position: " << rhs.getPositionByName(it->name) << '\n';
+        }
     }
 }
 
@@ -792,6 +879,23 @@ Serializations Block::getSerializations() const
 
     for (const auto & column : data)
         res.push_back(column.type->getDefaultSerialization());
+
+    return res;
+}
+
+Serializations Block::getSerializations(const SerializationInfoByName & hints) const
+{
+    Serializations res;
+    res.reserve(data.size());
+
+    for (const auto & column : data)
+    {
+        auto it = hints.find(column.name);
+        if (it == hints.end())
+            res.push_back(column.type->getDefaultSerialization());
+        else
+            res.push_back(column.type->getSerialization(*it->second));
+    }
 
     return res;
 }

@@ -3,9 +3,13 @@
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVector.h>
+#include <Columns/ColumnsCommon.h>
+#include <Core/Settings.h>
 #include <Interpreters/castColumn.h>
 #include <Interpreters/Context.h>
 #include <numeric>
@@ -14,6 +18,10 @@
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsUInt64 function_range_max_elements_in_block;
+}
 
 namespace ErrorCodes
 {
@@ -21,6 +29,7 @@ namespace ErrorCodes
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 
@@ -36,13 +45,14 @@ public:
 
     const size_t max_elements;
     static FunctionPtr create(ContextPtr context_) { return std::make_shared<FunctionRange>(std::move(context_)); }
-    explicit FunctionRange(ContextPtr context) : max_elements(context->getSettingsRef().function_range_max_elements_in_block) {}
+    explicit FunctionRange(ContextPtr context) : max_elements(context->getSettingsRef()[Setting::function_range_max_elements_in_block]) { }
 
 private:
     String getName() const override { return name; }
 
     size_t getNumberOfArguments() const override { return 0; }
     bool isVariadic() const override { return true; }
+    bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
@@ -55,14 +65,24 @@ private:
                 getName(), arguments.size());
         }
 
-        for (const auto & arg : arguments)
+        if (std::find_if (arguments.cbegin(), arguments.cend(), [](const auto & arg) { return arg->onlyNull(); }) != arguments.cend())
+            return makeNullable(std::make_shared<DataTypeNothing>());
+
+        DataTypes arg_types;
+        for (size_t i = 0, size = arguments.size(); i < size; ++i)
         {
-            if (!isInteger(arg))
+            DataTypePtr type_no_nullable = removeNullable(arguments[i]);
+
+            if (i < 2 && WhichDataType(type_no_nullable).isIPv4())
+                arg_types.emplace_back(std::make_shared<DataTypeUInt32>());
+            else if (isInteger(type_no_nullable))
+                arg_types.push_back(type_no_nullable);
+            else
                 throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument of function {}",
-                    arg->getName(), getName());
+                    arguments[i]->getName(), getName());
         }
 
-        DataTypePtr common_type = getLeastSupertype(arguments);
+        DataTypePtr common_type = getLeastSupertype(arg_types);
         return std::make_shared<DataTypeArray>(common_type);
     }
 
@@ -104,7 +124,7 @@ private:
             for (size_t row_idx = 0, rows = in->size(); row_idx < rows; ++row_idx)
             {
                 for (T elem_idx = 0, elems = in_data[row_idx]; elem_idx < elems; ++elem_idx)
-                    out_data[offset + elem_idx] = static_cast<T>(elem_idx);
+                    out_data[offset + elem_idx] = elem_idx;
 
                 offset += in_data[row_idx];
                 out_offsets[row_idx] = offset;
@@ -112,8 +132,7 @@ private:
 
             return ColumnArray::create(std::move(data_col), std::move(offsets_col));
         }
-        else
-            return nullptr;
+        return nullptr;
     }
 
     template <typename T>
@@ -371,6 +390,10 @@ private:
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
+        NullPresence null_presence = getNullPresense(arguments);
+        if (null_presence.has_null_constant)
+            return result_type->createColumnConstWithDefaultValue(input_rows_count);
+
         DataTypePtr elem_type = checkAndGetDataType<DataTypeArray>(result_type.get())->getNestedType();
         WhichDataType which(elem_type);
 
@@ -381,10 +404,31 @@ private:
                             "for unsigned/signed integers up to 64 bit", getName());
         }
 
+        auto throwIfNullValue = [&](const ColumnWithTypeAndName & col)
+        {
+            if (!col.type->isNullable())
+                return;
+            const ColumnNullable * nullable_col = checkAndGetColumn<ColumnNullable>(col.column.get());
+            if (!nullable_col)
+                nullable_col = checkAndGetColumnConstData<ColumnNullable>(col.column.get());
+            if (!nullable_col)
+                return;
+            const auto & null_map = nullable_col->getNullMapData();
+            if (!memoryIsZero(null_map.data(), 0, null_map.size()))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Illegal (null) value column {} of argument of function {}", col.column->getName(), getName());
+        };
+
         ColumnPtr res;
         if (arguments.size() == 1)
         {
+            throwIfNullValue(arguments[0]);
             const auto * col = arguments[0].column.get();
+            if (arguments[0].type->isNullable())
+            {
+                const auto & nullable = checkAndGetColumn<ColumnNullable>(*arguments[0].column);
+                col = nullable.getNestedColumnPtr().get();
+            }
+
             if (!((res = executeInternal<UInt8>(col)) || (res = executeInternal<UInt16>(col)) || (res = executeInternal<UInt32>(col))
                   || (res = executeInternal<UInt64>(col)) || (res = executeInternal<Int8>(col)) || (res = executeInternal<Int16>(col))
                   || (res = executeInternal<Int32>(col)) || (res = executeInternal<Int64>(col))))
@@ -399,6 +443,7 @@ private:
 
         for (size_t i = 0; i < arguments.size(); ++i)
         {
+            throwIfNullValue(arguments[i]);
             if (i == 1)
                 columns_holder[i] = castColumn(arguments[i], elem_type)->convertToFullColumnIfConst();
             else

@@ -1,7 +1,11 @@
 ---
 slug: /en/operations/system-tables/schema_inference_cache
 ---
+import SystemTableCloud from '@site/docs/en/_snippets/_system_table_cloud.md';
+
 # schema_inference_cache
+
+<SystemTableCloud/>
 
 Contains information about all cached file schemas.
 
@@ -66,4 +70,4 @@ schema:                 id Nullable(Float64), age Nullable(Float64), name Nullab
 
 
 **See also**
--   [Automatic schema inference from input data](/docs/en/interfaces/schema-inference.md)
+- [Automatic schema inference from input data](/docs/en/interfaces/schema-inference.md)

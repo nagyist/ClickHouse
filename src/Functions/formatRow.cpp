@@ -5,6 +5,7 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
+#include <Functions/IFunctionAdaptors.h>
 #include <IO/WriteBufferFromVector.h>
 #include <IO/WriteHelpers.h>
 #include <Processors/Formats/IOutputFormat.h>
@@ -18,7 +19,6 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int UNKNOWN_FORMAT;
     extern const int BAD_ARGUMENTS;
 }
 
@@ -35,10 +35,18 @@ class FunctionFormatRow : public IFunction
 public:
     static constexpr auto name = no_newline ? "formatRowNoNewline" : "formatRow";
 
-    FunctionFormatRow(const String & format_name_, ContextPtr context_) : format_name(format_name_), context(context_)
+    FunctionFormatRow(String format_name_, Names arguments_column_names_, ContextPtr context_)
+        : format_name(std::move(format_name_))
+        , arguments_column_names(std::move(arguments_column_names_))
+        , context(std::move(context_))
+        , format_settings(getFormatSettings(context))
     {
-        if (!FormatFactory::instance().getAllFormats().contains(format_name))
-            throw Exception(ErrorCodes::UNKNOWN_FORMAT, "Unknown format {}", format_name);
+        FormatFactory::instance().checkFormatName(format_name);
+
+        /// We don't need handling exceptions while formatting as a row.
+        /// But it can be enabled in query sent via http interface.
+        format_settings.json.valid_output_on_exception = false;
+        format_settings.xml.valid_output_on_exception = false;
     }
 
     String getName() const override { return name; }
@@ -52,14 +60,21 @@ public:
     {
         auto col_str = ColumnString::create();
         ColumnString::Chars & vec = col_str->getChars();
-        WriteBufferFromVector buffer(vec);
+        WriteBufferFromVector<ColumnString::Chars> buffer(vec);
         ColumnString::Offsets & offsets = col_str->getOffsets();
         offsets.resize(input_rows_count);
+
         Block arg_columns;
-        for (auto i = 1u; i < arguments.size(); ++i)
-            arg_columns.insert(arguments[i]);
+
+        size_t arguments_size = arguments.size();
+        for (size_t i = 1; i < arguments_size; ++i)
+        {
+            auto argument_column = arguments[i];
+            argument_column.name = arguments_column_names[i];
+            arg_columns.insert(std::move(argument_column));
+        }
+
         materializeBlockInplace(arg_columns);
-        auto format_settings = getFormatSettings(context);
         auto out = FormatFactory::instance().getOutputFormat(format_name, buffer, arg_columns, context, format_settings);
 
         /// This function make sense only for row output formats.
@@ -93,7 +108,9 @@ public:
 
 private:
     String format_name;
+    Names arguments_column_names;
     ContextPtr context;
+    FormatSettings format_settings;
 };
 
 template <bool no_newline>
@@ -115,13 +132,17 @@ public:
             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
                 "Function {} requires at least two arguments: the format name and its output expression(s)", getName());
 
+        Names arguments_column_names;
+        arguments_column_names.reserve(arguments.size());
+        for (const auto & argument : arguments)
+            arguments_column_names.push_back(argument.name);
+
         if (const auto * name_col = checkAndGetColumnConst<ColumnString>(arguments.at(0).column.get()))
             return std::make_unique<FunctionToFunctionBaseAdaptor>(
-                std::make_shared<FunctionFormatRow<no_newline>>(name_col->getValue<String>(), context),
+                std::make_shared<FunctionFormatRow<no_newline>>(name_col->getValue<String>(), std::move(arguments_column_names), context),
                 collections::map<DataTypes>(arguments, [](const auto & elem) { return elem.type; }),
                 return_type);
-        else
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "First argument to {} must be a format name", getName());
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "First argument to {} must be a format name", getName());
     }
 
     DataTypePtr getReturnTypeImpl(const DataTypes &) const override { return std::make_shared<DataTypeString>(); }

@@ -20,13 +20,13 @@ void testLowCardinalityNumberInsert(const DataTypePtr & data_type)
 
     Field value;
     column->get(0, value);
-    ASSERT_EQ(value.get<T>(), 15);
+    ASSERT_EQ(value.safeGet<T>(), 15);
 
     column->get(1, value);
-    ASSERT_EQ(value.get<T>(), 20);
+    ASSERT_EQ(value.safeGet<T>(), 20);
 
     column->get(2, value);
-    ASSERT_EQ(value.get<T>(), 25);
+    ASSERT_EQ(value.safeGet<T>(), 25);
 }
 
 TEST(ColumnLowCardinality, Insert)
@@ -45,6 +45,20 @@ TEST(ColumnLowCardinality, Insert)
     testLowCardinalityNumberInsert<Int128>(std::make_shared<DataTypeInt128>());
     testLowCardinalityNumberInsert<Int256>(std::make_shared<DataTypeInt256>());
 
+    testLowCardinalityNumberInsert<BFloat16>(std::make_shared<DataTypeBFloat16>());
     testLowCardinalityNumberInsert<Float32>(std::make_shared<DataTypeFloat32>());
     testLowCardinalityNumberInsert<Float64>(std::make_shared<DataTypeFloat64>());
+}
+
+TEST(ColumnLowCardinality, Clone)
+{
+    auto data_type = std::make_shared<DataTypeInt32>();
+    auto low_cardinality_type = std::make_shared<DataTypeLowCardinality>(data_type);
+    auto column = low_cardinality_type->createColumn();
+    ASSERT_FALSE(assert_cast<const ColumnLowCardinality &>(*column).nestedIsNullable());
+
+    auto nullable_column = assert_cast<const ColumnLowCardinality &>(*column).cloneNullable();
+
+    ASSERT_TRUE(assert_cast<const ColumnLowCardinality &>(*nullable_column).nestedIsNullable());
+    ASSERT_FALSE(assert_cast<const ColumnLowCardinality &>(*column).nestedIsNullable());
 }

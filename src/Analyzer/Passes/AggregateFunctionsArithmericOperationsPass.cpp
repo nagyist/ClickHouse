@@ -9,9 +9,17 @@
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
+#include <Analyzer/Utils.h>
+
+#include <Core/Settings.h>
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool optimize_arithmetic_operations_in_aggregate_functions;
+}
+
 
 namespace ErrorCodes
 {
@@ -32,6 +40,10 @@ Field zeroField(const Field & value)
         case Field::Types::Int128: return static_cast<Int128>(0);
         case Field::Types::UInt256: return static_cast<UInt256>(0);
         case Field::Types::Int256: return static_cast<Int256>(0);
+        case Field::Types::Decimal32: return static_cast<Decimal32>(0);
+        case Field::Types::Decimal64: return static_cast<Decimal64>(0);
+        case Field::Types::Decimal128: return static_cast<Decimal128>(0);
+        case Field::Types::Decimal256: return static_cast<Decimal256>(0);
         default:
             break;
     }
@@ -51,15 +63,9 @@ public:
     using Base = InDepthQueryTreeVisitorWithContext<AggregateFunctionsArithmericOperationsVisitor>;
     using Base::Base;
 
-    /// Traverse tree bottom to top
-    static bool shouldTraverseTopToBottom()
+    void enterImpl(QueryTreeNodePtr & node)
     {
-        return false;
-    }
-
-    void visitImpl(QueryTreeNodePtr & node)
-    {
-        if (!getSettings().optimize_arithmetic_operations_in_aggregate_functions)
+        if (!getSettings()[Setting::optimize_arithmetic_operations_in_aggregate_functions])
             return;
 
         auto * aggregate_function_node = node->as<FunctionNode>();
@@ -99,19 +105,23 @@ public:
         const auto * left_argument_constant_node = arithmetic_function_arguments_nodes[0]->as<ConstantNode>();
         const auto * right_argument_constant_node = arithmetic_function_arguments_nodes[1]->as<ConstantNode>();
 
-        /** If we extract negative constant, aggregate function name must be updated.
+        if (!left_argument_constant_node && !right_argument_constant_node)
+            return;
+
+        /** Need reverse max <-> min for:
           *
-          * Example: SELECT min(-1 * id);
-          * Result: SELECT -1 * max(id);
+          * max(-1*value) -> -1*min(value)
+          * max(value/-2) -> min(value)/-2
+          * max(1-value) -> 1-min(value)
           */
-        std::string aggregate_function_name_if_constant_is_negative;
-        if (arithmetic_function_name == "multiply" || arithmetic_function_name == "divide")
+        auto get_reverse_aggregate_function_name = [](const std::string & aggregate_function_name) -> std::string
         {
-            if (lower_aggregate_function_name == "min")
-                aggregate_function_name_if_constant_is_negative = "max";
-            else if (lower_aggregate_function_name == "max")
-                aggregate_function_name_if_constant_is_negative = "min";
-        }
+            if (aggregate_function_name == "min")
+                return "max";
+            if (aggregate_function_name == "max")
+                return "min";
+            return aggregate_function_name;
+        };
 
         size_t arithmetic_function_argument_index = 0;
 
@@ -123,11 +133,11 @@ public:
 
             /// Rewrite `aggregate_function(inner_function(constant, argument))` into `inner_function(constant, aggregate_function(argument))`
             const auto & left_argument_constant_value_literal = left_argument_constant_node->getValue();
-            if (!aggregate_function_name_if_constant_is_negative.empty() &&
-                left_argument_constant_value_literal < zeroField(left_argument_constant_value_literal))
-            {
-                lower_aggregate_function_name = aggregate_function_name_if_constant_is_negative;
-            }
+            bool need_reverse = (arithmetic_function_name == "multiply" && left_argument_constant_value_literal < zeroField(left_argument_constant_value_literal))
+                || (arithmetic_function_name == "minus");
+
+            if (need_reverse)
+                lower_aggregate_function_name = get_reverse_aggregate_function_name(lower_aggregate_function_name);
 
             arithmetic_function_argument_index = 1;
         }
@@ -135,11 +145,10 @@ public:
         {
             /// Rewrite `aggregate_function(inner_function(argument, constant))` into `inner_function(aggregate_function(argument), constant)`
             const auto & right_argument_constant_value_literal = right_argument_constant_node->getValue();
-            if (!aggregate_function_name_if_constant_is_negative.empty() &&
-                right_argument_constant_value_literal < zeroField(right_argument_constant_value_literal))
-            {
-                lower_aggregate_function_name = aggregate_function_name_if_constant_is_negative;
-            }
+            bool need_reverse = (arithmetic_function_name == "multiply" || arithmetic_function_name == "divide") && right_argument_constant_value_literal < zeroField(right_argument_constant_value_literal);
+
+            if (need_reverse)
+                lower_aggregate_function_name = get_reverse_aggregate_function_name(lower_aggregate_function_name);
 
             arithmetic_function_argument_index = 0;
         }
@@ -166,38 +175,20 @@ private:
 
         auto aggregate_function_clone = aggregate_function->clone();
         auto & aggregate_function_clone_typed = aggregate_function_clone->as<FunctionNode &>();
+
         aggregate_function_clone_typed.getArguments().getNodes() = { arithmetic_function_clone_argument };
-        resolveAggregateFunctionNode(aggregate_function_clone_typed, arithmetic_function_clone_argument, result_aggregate_function_name);
+        resolveAggregateFunctionNodeByName(aggregate_function_clone_typed, result_aggregate_function_name);
 
         arithmetic_function_clone_arguments_nodes[arithmetic_function_argument_index] = std::move(aggregate_function_clone);
-        resolveOrdinaryFunctionNode(arithmetic_function_clone_typed, arithmetic_function_clone_typed.getFunctionName());
+        resolveOrdinaryFunctionNodeByName(arithmetic_function_clone_typed, arithmetic_function_clone_typed.getFunctionName(), getContext());
 
         return arithmetic_function_clone;
-    }
-
-    inline void resolveOrdinaryFunctionNode(FunctionNode & function_node, const String & function_name) const
-    {
-        auto function = FunctionFactory::instance().get(function_name, getContext());
-        function_node.resolveAsFunction(function->build(function_node.getArgumentColumns()));
-    }
-
-    static inline void resolveAggregateFunctionNode(FunctionNode & function_node, const QueryTreeNodePtr & argument, const String & aggregate_function_name)
-    {
-        auto function_aggregate_function = function_node.getAggregateFunction();
-
-        AggregateFunctionProperties properties;
-        auto aggregate_function = AggregateFunctionFactory::instance().get(aggregate_function_name,
-            { argument->getResultType() },
-            function_aggregate_function->getParameters(),
-            properties);
-
-        function_node.resolveAsAggregateFunction(std::move(aggregate_function));
     }
 };
 
 }
 
-void AggregateFunctionsArithmericOperationsPass::run(QueryTreeNodePtr query_tree_node, ContextPtr context)
+void AggregateFunctionsArithmericOperationsPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
 {
     AggregateFunctionsArithmericOperationsVisitor visitor(std::move(context));
     visitor.visit(query_tree_node);

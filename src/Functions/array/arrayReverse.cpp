@@ -91,6 +91,8 @@ ColumnPtr FunctionArrayReverse::executeImpl(const ColumnsWithTypeAndName & argum
         || executeFixedString(*src_inner_col, offsets, *res_inner_col)
         || executeGeneric(*src_inner_col, offsets, *res_inner_col);
 
+    chassert(bool(src_nullable_col) == bool(res_nullable_col));
+
     if (src_nullable_col)
         if (!executeNumber<UInt8>(src_nullable_col->getNullMapColumn(), offsets, res_nullable_col->getNullMapColumn()))
             throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of null map of the first argument of function {}",
@@ -156,8 +158,7 @@ bool FunctionArrayReverse::executeNumber(const IColumn & src_data, const ColumnA
 
         return true;
     }
-    else
-        return false;
+    return false;
 }
 
 bool FunctionArrayReverse::executeFixedString(const IColumn & src_data, const ColumnArray::Offsets & src_offsets, IColumn & res_data)
@@ -194,8 +195,7 @@ bool FunctionArrayReverse::executeFixedString(const IColumn & src_data, const Co
         }
         return true;
     }
-    else
-        return false;
+    return false;
 }
 
 bool FunctionArrayReverse::executeString(const IColumn & src_data, const ColumnArray::Offsets & src_array_offsets, IColumn & res_data)
@@ -240,8 +240,7 @@ bool FunctionArrayReverse::executeString(const IColumn & src_data, const ColumnA
 
         return true;
     }
-    else
-        return false;
+    return false;
 }
 
 

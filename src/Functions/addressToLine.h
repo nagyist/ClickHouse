@@ -13,7 +13,6 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <IO/WriteBufferFromArena.h>
-#include <IO/WriteHelpers.h>
 #include <Access/Common/AccessFlags.h>
 #include <Interpreters/Context.h>
 
@@ -90,8 +89,7 @@ protected:
 
     ResultT impl(uintptr_t addr) const
     {
-        auto symbol_index_ptr = SymbolIndex::instance();
-        const SymbolIndex & symbol_index = *symbol_index_ptr;
+        const SymbolIndex & symbol_index = SymbolIndex::instance();
 
         if (const auto * object = symbol_index.findObject(reinterpret_cast<const void *>(addr)))
         {
@@ -107,11 +105,9 @@ protected:
                 setResult(result, location, frames);
                 return result;
             }
-            else
-                return {object->name};
+            return {object->name};
         }
-        else
-            return {};
+        return {};
     }
 
     ResultT implCached(uintptr_t addr) const

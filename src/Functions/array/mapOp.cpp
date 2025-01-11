@@ -1,19 +1,19 @@
-#include <cassert>
 #include <Columns/ColumnFixedString.h>
+#include <Columns/ColumnMap.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVector.h>
 #include <Columns/IColumn.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <base/arithmeticOverflow.h>
-#include "Columns/ColumnMap.h"
-#include "DataTypes/DataTypeMap.h"
 
+#include <cassert>
 
 namespace DB
 {
@@ -37,7 +37,7 @@ struct TupArg
 };
 using TupleMaps = std::vector<TupArg>;
 
-enum class OpTypes
+enum class OpTypes : uint8_t
 {
     ADD = 0,
     SUBTRACT = 1
@@ -81,7 +81,9 @@ private:
 
     DataTypePtr getReturnTypeForTuples(const DataTypes & arguments) const
     {
-        DataTypePtr key_type, val_type, res;
+        DataTypePtr key_type;
+        DataTypePtr val_type;
+        DataTypePtr res;
 
         for (const auto & arg : arguments)
         {
@@ -104,7 +106,7 @@ private:
                 throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Each tuple in {} arguments should consist of two arrays",
                     getName());
 
-            auto result_type = v->getNestedType();
+            const auto & result_type = v->getNestedType();
             if (!result_type->canBePromoted())
                 throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Values to be summed are expected to be Numeric, Float or Decimal.");
 
@@ -125,7 +127,9 @@ private:
 
     DataTypePtr getReturnTypeForMaps(const DataTypes & arguments) const
     {
-        DataTypePtr key_type, val_type, res;
+        DataTypePtr key_type;
+        DataTypePtr val_type;
+        DataTypePtr res;
 
         for (const auto & arg : arguments)
         {
@@ -159,17 +163,17 @@ private:
 
         if (arguments[0]->getTypeId() == TypeIndex::Tuple)
             return getReturnTypeForTuples(arguments);
-        else if (arguments[0]->getTypeId() == TypeIndex::Map)
+        if (arguments[0]->getTypeId() == TypeIndex::Map)
             return getReturnTypeForMaps(arguments);
-        else
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "{} only accepts maps", getName());
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "{} only accepts maps", getName());
     }
 
     template <typename KeyType, typename ValType>
     ColumnPtr execute2(size_t row_count, TupleMaps & args, const DataTypePtr res_type) const
     {
         MutableColumnPtr res_column = res_type->createColumn();
-        IColumn *to_keys_data, *to_vals_data;
+        IColumn *to_keys_data;
+        IColumn *to_vals_data;
         ColumnArray::Offsets * to_keys_offset;
         ColumnArray::Offsets * to_vals_offset = nullptr;
 
@@ -205,7 +209,8 @@ private:
             [[maybe_unused]] bool first = true;
             for (auto & arg : args)
             {
-                size_t offset = 0, len = arg.key_offsets[0];
+                size_t offset = 0;
+                size_t len = arg.key_offsets[0];
 
                 if (!arg.is_const)
                 {
@@ -237,7 +242,7 @@ private:
                     }
 
                     arg.val_column->get(offset + j, temp_val);
-                    ValType value = temp_val.get<ValType>();
+                    ValType value = temp_val.safeGet<ValType>();
 
                     if constexpr (op_type == OpTypes::ADD)
                     {
@@ -294,6 +299,10 @@ private:
                 return execute2<KeyType, UInt256>(row_count, args, res_type);
             case TypeIndex::Float64:
                 return execute2<KeyType, Float64>(row_count, args, res_type);
+            case TypeIndex::Decimal128:
+                return execute2<KeyType, Decimal128>(row_count, args, res_type);
+            case TypeIndex::Decimal256:
+                return execute2<KeyType, Decimal256>(row_count, args, res_type);
             default:
                 throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal column type {} for values in arguments of function {}",
                     res_value_type->getName(), getName());
