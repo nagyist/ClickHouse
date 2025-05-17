@@ -4,6 +4,7 @@ import traceback
 from typing import Any
 
 from ._environment import _Environment
+from .info import Info
 from .result import Result
 from .settings import Settings
 from .utils import Shell
@@ -104,6 +105,27 @@ class GH:
         return list(set(res))
 
     @classmethod
+    def get_pr_title_body_labels(cls, pr=None, repo=None):
+        if not repo:
+            repo = _Environment.get().REPOSITORY
+        if not pr:
+            pr = _Environment.get().PR_NUMBER
+
+        cmd = f"gh pr view {pr} --json title,body,labels --repo {repo}"
+        output = Shell.get_output(cmd, verbose=True)
+        try:
+            pr_data = json.loads(output)
+            title = pr_data["title"]
+            body = pr_data["body"]
+            labels = [l["name"] for l in pr_data["labels"]]
+        except Exception:
+            print("ERROR: Failed to get PR data")
+            traceback.print_exc()
+            Info().store_traceback()
+            return "", "", []
+        return title, body, labels
+
+    @classmethod
     def get_pr_label_assigner(cls, label, pr=None, repo=None):
         if not repo:
             repo = _Environment.get().REPOSITORY
@@ -124,6 +146,7 @@ class GH:
         :param repo:
         :return: True or False in case of error
         """
+        description = description.replace("'", "'\"'\"'")  # escape single quote
         status = cls.convert_to_gh_status(status)
         repo = _Environment.get().REPOSITORY
         command = (
