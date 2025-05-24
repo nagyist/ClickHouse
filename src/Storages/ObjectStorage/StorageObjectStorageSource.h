@@ -14,6 +14,8 @@ namespace DB
 
 class SchemaCache;
 
+using ReadTaskCallback = std::function<String()>;
+
 class StorageObjectStorageSource : public SourceWithKeyCondition
 {
     friend class ObjectStorageQueueSource;
@@ -54,6 +56,7 @@ public:
         bool distributed_processing,
         const ContextPtr & local_context,
         const ActionsDAG::Node * predicate,
+        const std::optional<ActionsDAG> & filter_actions_dag,
         const NamesAndTypesList & virtual_columns,
         ObjectInfos * read_keys,
         std::function<void(FileProgress)> file_progress_callback = {},
