@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -140,6 +141,11 @@ def main():
         if not clickhouse_server_link.is_file():
             Shell.check(f"ln -sf {clickhouse_bin_path} {clickhouse_server_link}")
         Shell.check(f"chmod +x {clickhouse_bin_path}")
+    else:
+        os.environ["SCCACHE_IDLE_TIMEOUT"] = "7200"
+        os.environ["SCCACHE_BUCKET"] = Settings.S3_ARTIFACT_PATH
+        os.environ["SCCACHE_S3_KEY_PREFIX"] = "ccache/sccache"
+        Shell.check("sccache --show-stats", verbose=True)
 
     Utils.add_to_PATH(f"{build_dir}/programs:{current_directory}/tests")
 
@@ -169,7 +175,6 @@ def main():
                 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DENABLE_THINLTO=0 -DENABLE_NURAFT=1 -DENABLE_SIMDJSON=1 \
                 -DENABLE_JEMALLOC=1 -DENABLE_LIBURING=1 -DENABLE_YAML_CPP=1 -DCOMPILER_CACHE=sccache",
                 workdir=build_dir,
-                with_log=True,
             )
         )
         res = results[-1].is_ok()
@@ -181,7 +186,6 @@ def main():
                 name="Build ClickHouse",
                 command="ninja clickhouse-bundle clickhouse-stripped",
                 workdir=build_dir,
-                with_log=True,
             )
         )
         Shell.check("sccache --show-stats")
@@ -199,7 +203,6 @@ def main():
                 name="Check and Compress binary",
                 command=commands,
                 workdir=build_dir,
-                with_log=True,
             )
         )
         res = results[-1].is_ok()
@@ -217,12 +220,12 @@ def main():
             Result.from_commands_run(
                 name="Install ClickHouse Config",
                 command=commands,
-                with_log=True,
             )
         )
         res = results[-1].is_ok()
 
     CH = ClickHouseProc(fast_test=True)
+    attach_debug = False
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
         step_name = "Start ClickHouse Server"
@@ -233,11 +236,7 @@ def main():
             Result.create_from(name=step_name, status=res, stopwatch=stop_watch_)
         )
         if not results[-1].is_ok():
-            attach_files.append(f"{temp_dir}/build/programs/clickhouse")
-            attach_files += [
-                f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.err.log",
-                f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.log",
-            ]
+            attach_debug = True
 
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
@@ -257,18 +256,19 @@ def main():
                 )
             )
         if not results[-1].is_ok():
-            attach_files.append(f"{temp_dir}/build/programs/clickhouse")
-            attach_files += [
-                f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.err.log",
-                f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.log",
-            ]
+            attach_debug = True
+
+    if attach_debug:
+        attach_files += [
+            Utils.compress_file(f"{temp_dir}/build/programs/clickhouse-stripped"),
+            f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.err.log",
+            f"{temp_dir}/var/log/clickhouse-server/clickhouse-server.log",
+        ]
 
     CH.terminate()
 
     Result.create_from(
-        results=results, stopwatch=stop_watch, files=list(set(attach_files))
-    ).add_job_summary_to_info(
-        with_local_run_command=True, with_test_in_run_command=True
+        results=results, stopwatch=stop_watch, files=attach_files
     ).complete_job()
 
 
