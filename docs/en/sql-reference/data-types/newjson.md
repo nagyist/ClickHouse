@@ -8,6 +8,19 @@ slug: /sql-reference/data-types/newjson
 title: 'JSON Data Type'
 ---
 
+import {CardSecondary} from '@clickhouse/click-ui/bundled';
+
+<CardSecondary
+  badgeState="success"
+  badgeText=""
+  description="Check out our JSON best practice guide for examples, advanced features and considerations for using the JSON type."
+  icon="book"
+  infoText="Read more"
+  infoUrl="/docs/best-practices/use-json-where-appropriate"
+  title="Looking for a guide?"
+/>
+<br/>
+
 The `JSON` type stores JavaScript Object Notation (JSON) documents in a single column.
 
 If you want to use the `JSON` type, and for the examples on this page, please use:
@@ -16,7 +29,10 @@ If you want to use the `JSON` type, and for the examples on this page, please us
 SET enable_json_type = 1
 ```
 
+:::note
+In ClickHouse Open-Source JSON data type is marked as production ready in version 25.3. It's not recommended to use this type in production in previous versions.
 :::
+
 
 To declare a column of `JSON` type, you can use the following syntax:
 
@@ -137,7 +153,7 @@ Our implementation will always assume the latter.
 For example:
 
 ```sql
-SELECT CAST('{"a.b.c" : 42}', 'JSON') as json
+SELECT CAST('{"a.b.c" : 42}', 'JSON') AS json
 ```
 
 will return:
@@ -310,7 +326,6 @@ During parsing of `JSON`, ClickHouse tries to detect the most appropriate data t
 It works similarly to [automatic schema inference from input data](/interfaces/schema-inference.md),
 and is controlled by the same settings:
  
-- [input_format_try_infer_integers](/operations/settings/formats#input_format_try_infer_integers)
 - [input_format_try_infer_dates](/operations/settings/formats#input_format_try_infer_dates)
 - [input_format_try_infer_datetimes](/operations/settings/formats#input_format_try_infer_datetimes)
 - [schema_inference_make_columns_nullable](/operations/settings/formats#schema_inference_make_columns_nullable)
@@ -578,7 +593,7 @@ Let's see an example of such a merge.
 First, let's create a table with a `JSON` column, set the limit of dynamic paths to `3` and then insert values with `5` different paths:
 
 ```sql title="Query"
-CREATE TABLE test (id UInt64, json JSON(max_dynamic_paths=3)) engine=MergeTree ORDER BY id;
+CREATE TABLE test (id UInt64, json JSON(max_dynamic_paths=3)) ENGINE=MergeTree ORDER BY id;
 SYSTEM STOP MERGES test;
 INSERT INTO test SELECT number, formatRow('JSONEachRow', number as a) FROM numbers(5);
 INSERT INTO test SELECT number, formatRow('JSONEachRow', number as b) FROM numbers(4);
@@ -776,7 +791,7 @@ It's possible to alter an existing table and change the type of the column to th
 **Example**
 
 ```sql title="Query"
-CREATE TABLE test (json String) ENGINE=MergeTree ORDeR BY tuple();
+CREATE TABLE test (json String) ENGINE=MergeTree ORDER BY tuple();
 INSERT INTO test VALUES ('{"a" : 42}'), ('{"a" : 43, "b" : "Hello"}'), ('{"a" : 44, "b" : [1, 2, 3]}'), ('{"c" : "2020-01-01"}');
 ALTER TABLE test MODIFY COLUMN json JSON;
 SELECT json, json.a, json.b, json.c FROM test;
@@ -793,38 +808,41 @@ SELECT json, json.a, json.b, json.c FROM test;
 
 ## Comparison between values of the JSON type {#comparison-between-values-of-the-json-type}
 
-Values of a `JSON` column cannot be compared with the `less/greater` functions, 
-but can be compared using the `equal` function.
-
-Two JSON objects are considered equal when they have the same set of paths and each of these paths has the same type and value in both objects.
+JSON objects are compared similarly to Maps. 
 
 For example:
 
 ```sql title="Query"
-CREATE TABLE test (json1 JSON(a UInt32), json2 JSON(a UInt32)) ENGINE=Memory;
+CREATE TABLE test (json1 JSON, json2 JSON) ENGINE=Memory;
 INSERT INTO test FORMAT JSONEachRow
-{"json1" : {"a" : 42, "b" : 42, "c" : "Hello"}, "json2" : {"a" : 42, "b" : 42, "c" : "Hello"}}
-{"json1" : {"a" : 42, "b" : 42, "c" : "Hello"}, "json2" : {"a" : 43, "b" : 42, "c" : "Hello"}}
-{"json1" : {"a" : 42, "b" : 42, "c" : "Hello"}, "json2" : {"a" : 43, "b" : 42, "c" : "Hello"}}
-{"json1" : {"a" : 42, "b" : 42, "c" : "Hello"}, "json2" : {"a" : 42, "b" : 42, "c" : "World"}}
-{"json1" : {"a" : 42, "b" : [1, 2, 3], "c" : "Hello"}, "json2" : {"a" : 42, "b" : 42, "c" : "Hello"}}
-{"json1" : {"a" : 42, "b" : 42.0, "c" : "Hello"}, "json2" : {"a" : 42, "b" : 42, "c" : "Hello"}}
-{"json1" : {"a" : 42, "b" : "42", "c" : "Hello"}, "json2" : {"a" : 42, "b" : 42, "c" : "Hello"}};
+{"json1" : {}, "json2" : {}}
+{"json1" : {"a" : 42}, "json2" : {}}
+{"json1" : {"a" : 42}, "json2" : {"a" : 41}}
+{"json1" : {"a" : 42}, "json2" : {"a" : 42}}
+{"json1" : {"a" : 42}, "json2" : {"a" : [1, 2, 3]}}
+{"json1" : {"a" : 42}, "json2" : {"a" : "Hello"}}
+{"json1" : {"a" : 42}, "json2" : {"b" : 42}}
+{"json1" : {"a" : 42}, "json2" : {"a" : 42, "b" : 42}}
+{"json1" : {"a" : 42}, "json2" : {"a" : 41, "b" : 42}}
 
-SELECT json1, json2, json1 == json2 FROM test;
+SELECT json1, json2, json1 < json2, json1 = json2, json1 > json2 FROM test;
 ```
 
 ```text title="Response"
-┌─json1──────────────────────────────────┬─json2─────────────────────────┬─equals(json1, json2)─┐
-│ {"a":42,"b":"42","c":"Hello"}          │ {"a":42,"b":"42","c":"Hello"} │                    1 │
-│ {"a":42,"b":"42","c":"Hello"}          │ {"a":43,"b":"42","c":"Hello"} │                    0 │
-│ {"a":42,"b":"42","c":"Hello"}          │ {"a":43,"b":"42","c":"Hello"} │                    0 │
-│ {"a":42,"b":"42","c":"Hello"}          │ {"a":42,"b":"42","c":"World"} │                    0 │
-│ {"a":42,"b":["1","2","3"],"c":"Hello"} │ {"a":42,"b":"42","c":"Hello"} │                    0 │
-│ {"a":42,"b":42,"c":"Hello"}            │ {"a":42,"b":"42","c":"Hello"} │                    0 │
-│ {"a":42,"b":"42","c":"Hello"}          │ {"a":42,"b":"42","c":"Hello"} │                    0 │
-└────────────────────────────────────────┴───────────────────────────────┴──────────────────────┘
+┌─json1──────┬─json2───────────────┬─less(json1, json2)─┬─equals(json1, json2)─┬─greater(json1, json2)─┐
+│ {}         │ {}                  │                  0 │                    1 │                     0 │
+│ {"a":"42"} │ {}                  │                  0 │                    0 │                     1 │
+│ {"a":"42"} │ {"a":"41"}          │                  0 │                    0 │                     1 │
+│ {"a":"42"} │ {"a":"42"}          │                  0 │                    1 │                     0 │
+│ {"a":"42"} │ {"a":["1","2","3"]} │                  0 │                    0 │                     1 │
+│ {"a":"42"} │ {"a":"Hello"}       │                  1 │                    0 │                     0 │
+│ {"a":"42"} │ {"b":"42"}          │                  1 │                    0 │                     0 │
+│ {"a":"42"} │ {"a":"42","b":"42"} │                  1 │                    0 │                     0 │
+│ {"a":"42"} │ {"a":"41","b":"42"} │                  0 │                    0 │                     1 │
+└────────────┴─────────────────────┴────────────────────┴──────────────────────┴───────────────────────┘
 ```
+
+**Note:** when 2 paths contain values of different data types, they are compared according to [comparison rule](/sql-reference/data-types/variant#comparing-values-of-variant-data) of `Variant` data type.
 
 ## Tips for better usage of the JSON type {#tips-for-better-usage-of-the-json-type}
 
